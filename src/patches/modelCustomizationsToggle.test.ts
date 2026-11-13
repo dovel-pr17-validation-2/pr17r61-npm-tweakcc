@@ -1,0 +1,233 @@
+import * as fs from 'node:fs/promises';
+
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { DEFAULT_SETTINGS } from '../defaultSettings';
+import { ClaudeCodeInstallationInfo, TweakccConfig } from '../types';
+import { updateConfigFile } from '../config';
+import { replaceFileBreakingHardLinks } from '../utils';
+import { restoreClijsFromBackup } from '../installationBackup';
+import { writeModelCustomizations } from './modelSelector';
+import { writeShowMoreItemsInSelectMenus } from './showMoreItemsInSelectMenus';
+import { applySystemPrompts } from './systemPrompts';
+import {
+  assertPatchedBundleParses,
+  PatchedBundleParseError,
+} from './parseGate';
+import { applyCustomization } from './index';
+
+const mockReadFile = vi.hoisted(() => vi.fn());
+
+vi.mock('node:fs/promises', () => ({
+  readFile: mockReadFile,
+}));
+
+vi.mock('../config', () => ({
+  CONFIG_DIR: '/tmp/tweakcc-test-config',
+  NATIVE_BINARY_BACKUP_FILE: '/tmp/tweakcc-test-config/native.backup',
+  updateConfigFile: vi.fn(async updateFn => {
+    const config = { changesApplied: false } as TweakccConfig;
+    updateFn(config);
+    return config;
+  }),
+}));
+
+vi.mock('../utils', async importOriginal => ({
+  ...(await importOriginal<typeof import('../utils')>()),
+  debug: vi.fn(),
+  replaceFileBreakingHardLinks: vi.fn(),
+}));
+
+vi.mock('../installationBackup', () => ({
+  restoreNativeBinaryFromBackup: vi.fn(),
+  restoreClijsFromBackup: vi.fn(async () => true),
+}));
+
+vi.mock('../nativeInstallationLoader', () => ({
+  extractClaudeJsFromNativeInstallation: vi.fn(),
+  repackNativeInstallation: vi.fn(),
+}));
+
+vi.mock('./modelSelector', () => ({
+  writeModelCustomizations: vi.fn((content: string) => `${content}|model`),
+}));
+
+vi.mock('./showMoreItemsInSelectMenus', () => ({
+  writeShowMoreItemsInSelectMenus: vi.fn(
+    (content: string) => `${content}|show`
+  ),
+}));
+
+vi.mock('./systemPrompts', () => ({
+  applySystemPrompts: vi.fn(async (content: string) => ({
+    newContent: content,
+    results: [],
+  })),
+}));
+
+// Keep the real PatchedBundleParseError class but stub the check so these unit
+// tests do not spawn `node --check`. The real gate is covered in parseGate.test.ts.
+vi.mock('./parseGate', async importActual => {
+  const actual = await importActual<typeof import('./parseGate')>();
+  return {
+    ...actual,
+    assertPatchedBundleParses: vi.fn(),
+  };
+});
+
+const PATCH_IDS = [
+  'model-customizations',
+  'show-more-items-in-select-menus',
+] as const;
+
+const baseConfig = (): TweakccConfig => ({
+  ccVersion: '',
+  ccInstallationPath: null,
+  lastModified: '2026-01-01T00:00:00.000Z',
+  changesApplied: false,
+  settings: {
+    ...DEFAULT_SETTINGS,
+    misc: {
+      ...DEFAULT_SETTINGS.misc,
+    },
+  },
+});
+
+const ccInstInfo: ClaudeCodeInstallationInfo = {
+  cliPath: '/tmp/claude-cli.js',
+  version: '2.1.63',
+  source: 'search-paths',
+};
+
+describe('model customization toggle patch conditions', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(fs.readFile).mockResolvedValue('base-content');
+  });
+
+  it('skips both model customization patches when disabled', async () => {
+    const config = baseConfig();
+    config.settings.misc.enableModelCustomizations = false;
+
+    const { results } = await applyCustomization(config, ccInstInfo, [
+      ...PATCH_IDS,
+    ]);
+
+    const modelResult = results.find(r => r.id === 'model-customizations');
+    const showMoreResult = results.find(
+      r => r.id === 'show-more-items-in-select-menus'
+    );
+
+    expect(modelResult).toMatchObject({ applied: false, skipped: true });
+    expect(showMoreResult).toMatchObject({ applied: false, skipped: true });
+    expect(vi.mocked(writeModelCustomizations)).not.toHaveBeenCalled();
+    expect(vi.mocked(writeShowMoreItemsInSelectMenus)).not.toHaveBeenCalled();
+    expect(vi.mocked(replaceFileBreakingHardLinks)).toHaveBeenCalledWith(
+      '/tmp/claude-cli.js',
+      'base-content',
+      'patch'
+    );
+  });
+
+  it('applies both model customization patches when enabled', async () => {
+    const config = baseConfig();
+    config.settings.misc.enableModelCustomizations = true;
+
+    const { results } = await applyCustomization(config, ccInstInfo, [
+      ...PATCH_IDS,
+    ]);
+
+    const modelResult = results.find(r => r.id === 'model-customizations');
+    const showMoreResult = results.find(
+      r => r.id === 'show-more-items-in-select-menus'
+    );
+
+    expect(modelResult).toMatchObject({ applied: true, failed: false });
+    expect(showMoreResult).toMatchObject({ applied: true, failed: false });
+    const savedConfig = await vi.mocked(updateConfigFile).mock.results[0].value;
+    expect(savedConfig.changesApplied).toBe(true);
+    expect(vi.mocked(writeModelCustomizations)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(writeShowMoreItemsInSelectMenus)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(replaceFileBreakingHardLinks)).toHaveBeenCalledWith(
+      '/tmp/claude-cli.js',
+      expect.stringContaining('base-content'),
+      'patch'
+    );
+  });
+
+  it('marks patches as failed when patch functions return null', async () => {
+    const config = baseConfig();
+    config.settings.misc.enableModelCustomizations = true;
+
+    vi.mocked(writeModelCustomizations).mockReturnValue(null);
+    vi.mocked(writeShowMoreItemsInSelectMenus).mockReturnValue(null);
+
+    const { results } = await applyCustomization(config, ccInstInfo, [
+      ...PATCH_IDS,
+    ]);
+
+    const modelResult = results.find(r => r.id === 'model-customizations');
+    const showMoreResult = results.find(
+      r => r.id === 'show-more-items-in-select-menus'
+    );
+
+    expect(modelResult).toMatchObject({ applied: false, failed: true });
+    expect(showMoreResult).toMatchObject({ applied: false, failed: true });
+    const savedConfig = await vi.mocked(updateConfigFile).mock.results[0].value;
+    expect(savedConfig.changesApplied).toBe(false);
+    expect(vi.mocked(replaceFileBreakingHardLinks)).toHaveBeenCalledWith(
+      '/tmp/claude-cli.js',
+      'base-content',
+      'patch'
+    );
+  });
+
+  it('runs plumbing required for apply customization', async () => {
+    await applyCustomization(baseConfig(), ccInstInfo, [...PATCH_IDS]);
+
+    expect(vi.mocked(restoreClijsFromBackup)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(applySystemPrompts)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(updateConfigFile)).toHaveBeenCalledTimes(1);
+  });
+
+  it('runs the parse gate on the patched bundle before writing', async () => {
+    await applyCustomization(baseConfig(), ccInstInfo, [...PATCH_IDS]);
+
+    expect(vi.mocked(assertPatchedBundleParses)).toHaveBeenCalledTimes(1);
+  });
+
+  it('aborts the write and marks changes not applied when the bundle fails to parse', async () => {
+    vi.mocked(assertPatchedBundleParses).mockImplementationOnce(() => {
+      throw new PatchedBundleParseError('SyntaxError: Unexpected token');
+    });
+
+    await expect(
+      applyCustomization(baseConfig(), ccInstInfo, [...PATCH_IDS])
+    ).rejects.toBeInstanceOf(PatchedBundleParseError);
+
+    // The broken bundle is never written.
+    expect(vi.mocked(replaceFileBreakingHardLinks)).not.toHaveBeenCalled();
+
+    // changesApplied is set to false (the binary was restored to pristine at
+    // the start of apply and never re-written), not left/marked true.
+    expect(vi.mocked(updateConfigFile)).toHaveBeenCalledTimes(1);
+    const mutator = vi.mocked(updateConfigFile).mock.calls[0][0];
+    const probe = { changesApplied: true } as TweakccConfig;
+    mutator(probe);
+    expect(probe.changesApplied).toBe(false);
+  });
+
+  it('rethrows an unexpected gate error without marking changes not applied', async () => {
+    vi.mocked(assertPatchedBundleParses).mockImplementationOnce(() => {
+      throw new Error('unexpected temp-file failure');
+    });
+
+    await expect(
+      applyCustomization(baseConfig(), ccInstInfo, [...PATCH_IDS])
+    ).rejects.toThrow('unexpected temp-file failure');
+
+    // Not a parse failure: config is left untouched and nothing is written.
+    expect(vi.mocked(updateConfigFile)).not.toHaveBeenCalled();
+    expect(vi.mocked(replaceFileBreakingHardLinks)).not.toHaveBeenCalled();
+  });
+});

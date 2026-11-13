@@ -1,0 +1,577 @@
+import { stringifyRegex } from '@/utils';
+import { InputPatternHighlighter } from '../types';
+import { findChalkVar, showDiff } from './index';
+import { isGraphContextActive } from './graphContext';
+
+// ======================================================================
+
+const buildChalkChain = (
+  chalkVar: string,
+  highlighter: InputPatternHighlighter
+): string => {
+  let chain = chalkVar;
+
+  if (highlighter.foregroundColor) {
+    const fgMatch = highlighter.foregroundColor.match(/\d+/g);
+    if (fgMatch) {
+      chain += `.rgb(${fgMatch.join(',')})`;
+    }
+  }
+
+  if (highlighter.backgroundColor) {
+    const bgMatch = highlighter.backgroundColor.match(/\d+/g);
+    if (bgMatch) {
+      chain += `.bgRgb(${bgMatch.join(',')})`;
+    }
+  }
+
+  if (highlighter.styling.includes('bold')) chain += '.bold';
+  if (highlighter.styling.includes('italic')) chain += '.italic';
+  if (highlighter.styling.includes('underline')) chain += '.underline';
+  if (highlighter.styling.includes('strikethrough')) chain += '.strikethrough';
+  if (highlighter.styling.includes('inverse')) chain += '.inverse';
+
+  return chain;
+};
+
+// ======================================================================
+
+const writeCustomHighlighterImpl = (oldFile: string): string | null => {
+  const jsxRenderRegex =
+    /return ([$\w]+)\.jsx\(([$\w]+),\{color:([$\w]+)\.highlight\?\.color,dimColor:\3\.highlight\?\.dimColor,inverse:\3\.highlight\?\.inverse,children:\1\.jsx\(([$\w]+),\{children:\3\.text\}\)\},([$\w]+)\)/;
+  const jsxMatch = oldFile.match(jsxRenderRegex);
+  if (jsxMatch && jsxMatch.index !== undefined) {
+    const jsxVar = jsxMatch[1];
+    const outerText = jsxMatch[2];
+    const segVar = jsxMatch[3];
+    const innerText = jsxMatch[4];
+    const keyVar = jsxMatch[5];
+    const esc = (s: string) => s.replace(/\$/g, '\\$');
+
+    const shimmerPattern = new RegExp(
+      `if\\(${esc(segVar)}\\.highlight\\?\\.shimmerColor&&${esc(segVar)}\\.highlight\\.color\\)return ${esc(jsxVar)}\\.jsx\\(`
+    );
+
+    let workingFile = oldFile;
+    const shimmerMatch = workingFile.match(shimmerPattern);
+    if (shimmerMatch && shimmerMatch.index !== undefined) {
+      const shimmerGuard =
+        `if(typeof ${segVar}.highlight?.color==='function')` +
+        `return ${jsxVar}.jsx(${outerText},{children:` +
+        `${jsxVar}.jsx(${innerText},{children:${segVar}.highlight.color(${segVar}.text)})},${keyVar});`;
+      workingFile =
+        workingFile.slice(0, shimmerMatch.index) +
+        shimmerGuard +
+        workingFile.slice(shimmerMatch.index);
+    }
+
+    const m2 = workingFile.match(jsxRenderRegex);
+    if (!m2 || m2.index === undefined) {
+      console.error(
+        'patch: inputPatternHighlighters: failed to re-find JSX renderer after shimmer patch'
+      );
+      return null;
+    }
+    const jv = m2[1];
+    const ot = m2[2];
+    const sv = m2[3];
+    const it = m2[4];
+    const kv = m2[5];
+
+    const augmentedRenderer =
+      `return ${jv}.jsx(${ot},{` +
+      `color:${sv}.highlight?.style?void 0:${sv}.highlight?.color,` +
+      `backgroundColor:${sv}.highlight?.style?void 0:${sv}.highlight?.backgroundColor,` +
+      `dimColor:${sv}.highlight?.dimColor,` +
+      `inverse:${sv}.highlight?.style?void 0:${sv}.highlight?.inverse,` +
+      `bold:${sv}.highlight?.style?void 0:${sv}.highlight?.bold,` +
+      `italic:${sv}.highlight?.style?void 0:${sv}.highlight?.italic,` +
+      `underline:${sv}.highlight?.style?void 0:${sv}.highlight?.underline,` +
+      `strikethrough:${sv}.highlight?.style?void 0:${sv}.highlight?.strikethrough,` +
+      `children:${jv}.jsx(${it},{children:${sv}.highlight?.style?${sv}.highlight.style(${sv}.text):${sv}.text})` +
+      `},${kv})`;
+
+    const newFile =
+      workingFile.slice(0, m2.index) +
+      augmentedRenderer +
+      workingFile.slice(m2.index + m2[0].length);
+
+    showDiff(oldFile, newFile, 'JSX shimmer guard + renderer', 0, 0);
+    return newFile;
+  }
+
+  // CC <2.1.83: if(N.highlight?.color)return createElement(T,{key:E},color:N.highlight.color,...)
+  const oldRegex =
+    /(if\(([$\w]+)\.highlight\?\.color\))((return [$\w]+\.createElement\([$\w]+,\{key:[$\w]+),color:[$\w]+\.highlight\.color(\},[$\w]+\.createElement\([$\w]+,null,)([$\w]+\.text)(\)\)));/;
+
+  const oldMatches = oldFile.match(oldRegex);
+  if (oldMatches && oldMatches.index !== undefined) {
+    const styledFormattedText = `${oldMatches[2]}.highlight.color(${oldMatches[6]})`;
+
+    const replacement =
+      oldMatches[1] +
+      `{if(typeof ${oldMatches[2]}.highlight.color==='function')` +
+      oldMatches[4] +
+      oldMatches[5] +
+      styledFormattedText +
+      oldMatches[7] +
+      ';else ' +
+      oldMatches[3] +
+      '}';
+
+    const newFile =
+      oldFile.slice(0, oldMatches.index) +
+      replacement +
+      oldFile.slice(oldMatches.index + oldMatches[0].length);
+
+    showDiff(
+      oldFile,
+      newFile,
+      replacement,
+      oldMatches.index,
+      oldMatches.index + oldMatches[0].length
+    );
+
+    return newFile;
+  }
+
+  // CC >=2.1.83: return createElement(T,{key:E,color:N.highlight?.color,...},createElement(IK,null,N.text))
+  // No if guard — color is passed as optional chain prop
+  const newRegex =
+    /(return ([$\w]+)\.createElement\(([$\w]+),\{key:([$\w]+)),color:([$\w]+)\.highlight\?\.color,dimColor:\5\.highlight\?\.dimColor,inverse:\5\.highlight\?\.inverse\},(\2\.createElement\([$\w]+,null,\5\.text\))\)/;
+
+  const newMatches = oldFile.match(newRegex);
+  if (!newMatches || newMatches.index === undefined) {
+    console.error(
+      'patch: inputPatternHighlighters: failed to find highlight?.color renderer pattern'
+    );
+    return null;
+  }
+
+  const reactVar = newMatches[2];
+  const textComp = newMatches[3];
+  const keyVar = newMatches[4];
+  const segVar = newMatches[5];
+  const _innerElem = newMatches[6]; // eslint-disable-line @typescript-eslint/no-unused-vars
+
+  // First, find and patch the shimmer branch that runs BEFORE the main return.
+  // Pattern: if(SEG.highlight.color)return REACT.createElement(TEXT,{key:KEY},SEG.text.split("").map(...))
+  // We need to insert a typeof check before it so function colors don't get caught by shimmer.
+  const shimmerPattern = new RegExp(
+    `if\\(${segVar.replace('$', '\\$')}\\.highlight\\.color\\)return ([$\\w]+)\\.createElement\\([$\\w]+,\\{key:[$\\w]+\\},${segVar.replace('$', '\\$')}\\.text\\.split\\(""\\)\\.map\\([^)]+\\)\\)`
+  );
+
+  let workingFile = oldFile;
+  const shimmerMatch = workingFile.match(shimmerPattern);
+  if (shimmerMatch && shimmerMatch.index !== undefined) {
+    const shimmerGuard =
+      `if(typeof ${segVar}.highlight?.color==='function')` +
+      `return ${reactVar}.createElement(${textComp},{key:${keyVar}},` +
+      `${reactVar}.createElement(${textComp},null,${segVar}.highlight.color(${segVar}.text)));`;
+    workingFile =
+      workingFile.slice(0, shimmerMatch.index) +
+      shimmerGuard +
+      workingFile.slice(shimmerMatch.index);
+  }
+
+  // Now patch the main return (which may have shifted due to shimmer insertion).
+  // The pristine renderer only reads color/dimColor/inverse from the highlight
+  // object. Extend it to also forward bold/italic/underline/strikethrough/
+  // backgroundColor so the highlighter push entries can express those styles.
+  const newMatches2 = workingFile.match(newRegex);
+  if (!newMatches2 || newMatches2.index === undefined) {
+    console.error(
+      'patch: inputPatternHighlighters: failed to re-find renderer after shimmer patch'
+    );
+    return null;
+  }
+
+  const reactVar2 = newMatches2[2];
+  const textComp2 = newMatches2[3];
+  const keyVar2 = newMatches2[4];
+  const segVar2 = newMatches2[5];
+  const innerElem2 = newMatches2[6];
+
+  const styledText =
+    `${segVar2}.highlight?.style?` +
+    `${segVar2}.highlight.style(${segVar2}.text):${segVar2}.text`;
+  const styledInnerElem = innerElem2.replace(`${segVar2}.text`, styledText);
+  const augmentedRenderer =
+    `return ${reactVar2}.createElement(${textComp2},{key:${keyVar2}` +
+    `,color:${segVar2}.highlight?.style?void 0:${segVar2}.highlight?.color` +
+    `,backgroundColor:${segVar2}.highlight?.style?void 0:${segVar2}.highlight?.backgroundColor` +
+    `,dimColor:${segVar2}.highlight?.dimColor` +
+    `,inverse:${segVar2}.highlight?.style?void 0:${segVar2}.highlight?.inverse` +
+    `,bold:${segVar2}.highlight?.style?void 0:${segVar2}.highlight?.bold` +
+    `,italic:${segVar2}.highlight?.style?void 0:${segVar2}.highlight?.italic` +
+    `,underline:${segVar2}.highlight?.style?void 0:${segVar2}.highlight?.underline` +
+    `,strikethrough:${segVar2}.highlight?.style?void 0:${segVar2}.highlight?.strikethrough` +
+    `},${styledInnerElem})`;
+
+  const newFile =
+    workingFile.slice(0, newMatches2.index) +
+    augmentedRenderer +
+    workingFile.slice(newMatches2.index + newMatches2[0].length);
+
+  showDiff(oldFile, newFile, 'shimmer guard + renderer', 0, 0);
+
+  return newFile;
+};
+
+// ======================================================================
+
+const writeCustomHighlighterCreation = (
+  oldFile: string,
+  chalkVar: string,
+  highlighters: InputPatternHighlighter[]
+): string | null => {
+  // CC <2.1.83: ,VAR=REACT.useMemo(()=>{let ARR=[];if(...)ARR.push(...)
+  // CC >=2.1.83: ;let VAR=REACT.useMemo(()=>{let ARR=[];for(...)...;if(...)ARR.push(...)
+  // CC >=2.1.140: same shape, but unrelated useMemos earlier in the file
+  // require the inner span to be length-bounded so the regex doesn't span
+  // across functions and latch onto the wrong useMemo opening.
+  const regex =
+    /((?:,|;let )[$\w]+=[$\w]+\.useMemo\(\(\)=>\{let [$\w]+=\[\];[\s\S]{0,2000}?)(if\([$\w]+&&[$\w]+&&![$\w]+\)([$\w]+)\.push\(\{start:[$\w]+,end:[$\w]+\+[$\w]+\.length,color:"warning",priority:\d+\})/;
+
+  const match = oldFile.match(regex);
+  if (!match || match.index === undefined) {
+    console.error(
+      'patch: inputPatternHighlighters: failed to find useMemo/push pattern'
+    );
+    return null;
+  }
+
+  const rangesVar = match[3];
+
+  const reactMemoPattern = /[^$\w]([$\w]+(?:\.default)?)\.useMemo\(/;
+  const reactMemoMatch = match[1].match(reactMemoPattern);
+  if (!reactMemoMatch) {
+    console.error(
+      'patch: inputPatternHighlighters: failed to extract React var from useMemo'
+    );
+    return null;
+  }
+  const _reactVarFromMemo = reactMemoMatch[1]; // eslint-disable-line @typescript-eslint/no-unused-vars
+
+  const searchStart = Math.max(0, match.index - 15000);
+  const searchWindow = oldFile.slice(searchStart, match.index);
+  // CC >=2.1.140: input is destructured from a hook as `inputValue:VAR,`.
+  // CC <2.1.140:  the input variable is passed as a prop named `input:VAR,`.
+  // Prefer the new form when present (the old form may also match unrelated
+  // function parameters in the same lookback window in 2.1.140).
+  const newInputPattern = /\binputValue:([$\w]+),/g;
+  const oldInputPattern = /\binput:([$\w]+),/g;
+  const newInputMatches = [...searchWindow.matchAll(newInputPattern)];
+  const oldInputMatches = [...searchWindow.matchAll(oldInputPattern)];
+  const inputMatch = newInputMatches.at(-1) ?? oldInputMatches.at(-1) ?? null;
+  if (!inputMatch) {
+    console.error(
+      'patch: inputPatternHighlighters: failed to find input variable pattern (looked for inputValue: and input:)'
+    );
+    return null;
+  }
+  const inputVar = inputMatch[1];
+
+  const useMemoCode = '';
+
+  const genCode = buildRangePushes(inputVar, rangesVar, chalkVar, highlighters);
+  if (!genCode) {
+    console.error(
+      'patch: inputPatternHighlighters: no usable highlighters generated (all skipped)'
+    );
+    return null;
+  }
+
+  const replacement = match[1] + genCode + match[2];
+
+  const beforeMatch = oldFile.slice(0, match.index);
+  const afterMatch = oldFile.slice(match.index + match[0].length);
+
+  let newFile = beforeMatch + useMemoCode + replacement + afterMatch;
+
+  // Add inputVar to the rw useMemo's dependency array so it re-runs when
+  // input changes. Find the useMemo that contains our for loop by tracking
+  // parens from the useMemo opening to its closing.
+  const forLoopIdx = newFile.indexOf(`for(let m of ${inputVar}.matchAll(`);
+  if (forLoopIdx > -1) {
+    const searchBack = newFile.slice(
+      Math.max(0, forLoopIdx - 2000),
+      forLoopIdx
+    );
+    const memoMatches = [...searchBack.matchAll(/useMemo\(\(\)=>\{/g)];
+    if (memoMatches.length > 0) {
+      const memoOffset =
+        Math.max(0, forLoopIdx - 2000) +
+        memoMatches[memoMatches.length - 1].index!;
+      const region = newFile.slice(memoOffset);
+      let depth = 0;
+      for (let i = 0; i < region.length; i++) {
+        if (region[i] === '(') depth++;
+        else if (region[i] === ')') {
+          depth--;
+          if (depth === 0) {
+            const absClose = memoOffset + i;
+            const before = newFile.slice(absClose - 1, absClose);
+            if (before === ']') {
+              const depsCheck = newFile.slice(absClose - 200, absClose);
+              if (!depsCheck.includes(`,${inputVar}]`)) {
+                newFile =
+                  newFile.slice(0, absClose - 1) +
+                  `,${inputVar}]` +
+                  newFile.slice(absClose);
+              }
+            }
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  showDiff(
+    oldFile,
+    newFile,
+    useMemoCode + replacement,
+    match.index,
+    match.index + match[0].length
+  );
+
+  return newFile;
+};
+
+// ======================================================================
+
+/**
+ * Code that pushes one highlight range per regex match of `inputExpr` onto
+ * `rangesVar`. Empty when no highlighter is usable.
+ */
+const buildRangePushes = (
+  inputExpr: string,
+  rangesVar: string,
+  chalkVar: string,
+  highlighters: InputPatternHighlighter[]
+): string => {
+  let genCode = '';
+  for (const highlighter of highlighters) {
+    const chalkChain = buildChalkChain(chalkVar, highlighter);
+
+    // Note: format handling for this branch is currently color/style-only.
+
+    let colorStr = highlighter.foregroundColor;
+    if (colorStr) {
+      const rgbMatch = colorStr.match(/^rgb\((\d+),\s*(\d+),\s*(\d+)\)$/);
+      if (rgbMatch) {
+        const [, r, g, b] = rgbMatch.map(Number);
+        colorStr = `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}`;
+      }
+    }
+    const colorValue = colorStr ? JSON.stringify(colorStr) : 'undefined';
+    let bgColorStr = highlighter.backgroundColor;
+    if (bgColorStr) {
+      const bgRgbMatch = bgColorStr.match(/^rgb\((\d+),\s*(\d+),\s*(\d+)\)$/);
+      if (bgRgbMatch) {
+        const [, r, g, b] = bgRgbMatch.map(Number);
+        bgColorStr = `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}`;
+      }
+    }
+    const bgColorValue = bgColorStr ? JSON.stringify(bgColorStr) : null;
+    const styling = highlighter.styling ?? [];
+    const isBold = styling.includes('bold');
+    const isItalic = styling.includes('italic');
+    const isUnderline = styling.includes('underline');
+    const isInverse = styling.includes('inverse');
+    const isDim = styling.includes('dim');
+    const isStrikethrough = styling.includes('strikethrough');
+
+    const regexSource =
+      highlighter.regex ??
+      (highlighter as unknown as { pattern?: string }).pattern;
+    if (!regexSource) {
+      console.error(
+        `patch: inputPatternHighlighters: highlighter "${highlighter.name}" has no regex/pattern; skipping`
+      );
+      continue;
+    }
+    let flags = highlighter.regexFlags ?? '';
+    if (!flags.includes('g')) {
+      flags += 'g';
+    }
+    let regex: RegExp;
+    try {
+      regex = new RegExp(regexSource, flags);
+    } catch (error) {
+      console.error(
+        `patch: inputPatternHighlighters: highlighter "${highlighter.name}" has invalid regex; skipping`,
+        error
+      );
+      continue;
+    }
+    const regexStr = stringifyRegex(regex);
+
+    genCode += `if(typeof ${inputExpr}==="string"){for(let m of ${inputExpr}.matchAll(${regexStr})){${rangesVar}.push({start:m.index,end:m.index+m[0].length,color:${colorValue}${bgColorValue ? `,backgroundColor:${bgColorValue}` : ''}${isBold ? ',bold:!0' : ''}${isItalic ? ',italic:!0' : ''}${isUnderline ? ',underline:!0' : ''}${isInverse ? ',inverse:!0' : ''}${isDim ? ',dimColor:!0' : ''}${isStrikethrough ? ',strikethrough:!0' : ''},style:(x)=>${chalkChain}(x),priority:100})}}`;
+  }
+  return genCode;
+};
+
+/**
+ * CC 2.1.2xx renderer: the JSX runtime is a bare minified import and the
+ * shimmer branch uses a block body:
+ *   if(x.highlight?.shimmerColor&&x.highlight.color){return e(n,{children:…},N)}
+ *   return e(n,{color:x.highlight?.color,dimColor:x.highlight?.dimColor,underline:x.highlight?.underline,children:e(Zr,{children:x.text})},N)
+ */
+const writeCustomHighlighterImplCodeSplit = (
+  oldFile: string
+): string | null => {
+  // CC 2.1.285 also passes backgroundColor/bold/italic/strikethrough natively
+  // (still not inverse, and no chalk `style` hook), so accept those too.
+  const rendererRegex =
+    /return ([$\w]+)\(([$\w]+),\{color:([$\w]+)\.highlight\?\.color,(?:backgroundColor:\3\.highlight\?\.backgroundColor,)?dimColor:\3\.highlight\?\.dimColor,(?:(?:underline|inverse|bold|italic|strikethrough):\3\.highlight\?\.(?:underline|inverse|bold|italic|strikethrough),)*children:\1\(([$\w]+),\{children:\3\.text\}\)\},([$\w]+)\)/;
+  const match = oldFile.match(rendererRegex);
+  if (!match || match.index === undefined) return null;
+  const [, jsx, outerText, seg, innerText, key] = match;
+  const esc = (s: string) => s.replace(/\$/g, '\\$');
+
+  let workingFile = oldFile;
+  const shimmer = workingFile.match(
+    new RegExp(
+      `if\\(${esc(seg)}\\.highlight\\?\\.shimmerColor&&${esc(seg)}\\.highlight\\.color\\)\\{?return ${esc(jsx)}\\(`
+    )
+  );
+  if (shimmer && shimmer.index !== undefined) {
+    const guard =
+      `if(typeof ${seg}.highlight?.color==='function')` +
+      `return ${jsx}(${outerText},{children:${jsx}(${innerText},{children:${seg}.highlight.color(${seg}.text)})},${key});`;
+    workingFile =
+      workingFile.slice(0, shimmer.index) +
+      guard +
+      workingFile.slice(shimmer.index);
+  }
+
+  const again = workingFile.match(rendererRegex);
+  if (!again || again.index === undefined) return null;
+  const augmented =
+    `return ${jsx}(${outerText},{` +
+    `color:${seg}.highlight?.style?void 0:${seg}.highlight?.color,` +
+    `backgroundColor:${seg}.highlight?.style?void 0:${seg}.highlight?.backgroundColor,` +
+    `dimColor:${seg}.highlight?.dimColor,` +
+    `inverse:${seg}.highlight?.style?void 0:${seg}.highlight?.inverse,` +
+    `bold:${seg}.highlight?.style?void 0:${seg}.highlight?.bold,` +
+    `italic:${seg}.highlight?.style?void 0:${seg}.highlight?.italic,` +
+    `underline:${seg}.highlight?.style?void 0:${seg}.highlight?.underline,` +
+    `strikethrough:${seg}.highlight?.style?void 0:${seg}.highlight?.strikethrough,` +
+    `children:${jsx}(${innerText},{children:${seg}.highlight?.style?${seg}.highlight.style(${seg}.text):${seg}.text})` +
+    `},${key})`;
+  const newFile =
+    workingFile.slice(0, again.index) +
+    augmented +
+    workingFile.slice(again.index + again[0].length);
+  showDiff(oldFile, newFile, 'code-split shimmer guard + renderer', 0, 0);
+  return newFile;
+};
+
+/**
+ * CC 2.1.2xx range builder: React-compiler memo block instead of useMemo,
+ * and the prompt text lives in a `draft` store (`draft.value`):
+ *   function PBe(h){let Lr=w(467),{ref:M,draft:E,…}=h,…
+ *   if(Lr[97]!==Cl||…){let Fi=[];if(ut&&wt&&!zt)Fi.push({start:Zo,end:Zo+gt.length,color:"warning",priority:20});…
+ * The memo guard does not know about our extra dependency (the text), so it
+ * is made to recompute on every render (range building is cheap).
+ */
+const writeCustomHighlighterCreationCodeSplit = (
+  oldFile: string,
+  chalkVar: string,
+  highlighters: InputPatternHighlighter[]
+): string | null => {
+  const regex =
+    /if\(([$\w]+\[\d+\]!==[$\w]+(?:\|\|[$\w]+\[\d+\]!==[$\w]+)*)\)\{let ([$\w]+)=\[\];(if\([$\w]+&&[$\w]+&&![$\w]+\)\2\.push\(\{start:[$\w]+,end:[$\w]+\+[$\w]+\.length,color:"warning",priority:\d+\}\))/;
+  const match = oldFile.match(regex);
+  if (!match || match.index === undefined) return null;
+  const [whole, guard, rangesVar, firstPush] = match;
+  const fnStart = oldFile.lastIndexOf('function ', match.index);
+  const header = oldFile.slice(fnStart, Math.min(match.index, fnStart + 1500));
+  const draft = header.match(/[{,]draft:([$\w]+)[,}]/);
+  if (!draft) return null;
+  const genCode = buildRangePushes(
+    `${draft[1]}.value`,
+    rangesVar,
+    chalkVar,
+    highlighters
+  );
+  if (!genCode) return null;
+  const replacement = `if(!0||${guard}){let ${rangesVar}=[];${genCode}${firstPush}`;
+  const newFile =
+    oldFile.slice(0, match.index) +
+    replacement +
+    oldFile.slice(match.index + whole.length);
+  showDiff(
+    oldFile,
+    newFile,
+    replacement,
+    match.index,
+    match.index + whole.length
+  );
+  return newFile;
+};
+
+// ======================================================================
+
+export const writeInputPatternHighlighters = (
+  oldFile: string,
+  highlighters: InputPatternHighlighter[]
+): string | null => {
+  // Treat missing `enabled` as enabled (only `false` disables a highlighter).
+  // Robust against partially-typed callers (e.g. defaults loaded from older
+  // configs or the probe harness).
+  const enabledHighlighters = highlighters.filter(h => h.enabled !== false);
+
+  if (enabledHighlighters.length === 0) {
+    console.error(
+      'patch: inputPatternHighlighters: no enabled highlighters provided'
+    );
+    return null;
+  }
+
+  const chalkVar = findChalkVar(oldFile);
+  if (!chalkVar) {
+    console.error(
+      '^ patch: inputPatternHighlighters: failed to find chalk variable'
+    );
+    return null;
+  }
+
+  let newFile: string | null;
+
+  // Code-split builds (CC 2.1.2xx): the renderer and the range builder are in
+  // different modules; patch whichever this module contains.
+  if (isGraphContextActive()) {
+    const renderer = writeCustomHighlighterImplCodeSplit(oldFile);
+    const creation = writeCustomHighlighterCreationCodeSplit(
+      renderer ?? oldFile,
+      chalkVar,
+      enabledHighlighters
+    );
+    return creation ?? renderer;
+  }
+
+  newFile = writeCustomHighlighterImpl(oldFile);
+  if (!newFile) {
+    console.error(
+      '^ patch: inputPatternHighlighters: writeCustomHighlighterImpl failed'
+    );
+    return null;
+  }
+
+  newFile = writeCustomHighlighterCreation(
+    newFile,
+    chalkVar,
+    enabledHighlighters
+  );
+  if (!newFile) {
+    console.error(
+      '^ patch: inputPatternHighlighters: writeCustomHighlighterCreation failed'
+    );
+    return null;
+  }
+
+  return newFile;
+};

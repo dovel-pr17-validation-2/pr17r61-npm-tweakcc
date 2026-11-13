@@ -1,0 +1,92 @@
+{
+  "name": "tweakcc",
+  "version": "4.4.0",
+  "type": "module",
+  "description": "Command-line tool to customize your Claude Code theme colors, thinking verbs and more.",
+  "main": "dist/lib/index.mjs",
+  "types": "dist/lib/index.d.ts",
+  "bin": {
+    "tweakcc": "./dist/index.mjs"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/lib/index.d.ts",
+      "default": "./dist/lib/index.mjs"
+    }
+  },
+  "scripts": {
+    "build": "tsc --noEmit && tsdown --minify --dts src/index.tsx src/lib/index.ts",
+    "build:dev": "tsdown --dts src/index.tsx src/lib/index.ts",
+    "watch": "tsdown --watch --dts src/index.tsx src/lib/index.ts",
+    "start": "node dist/index.mjs",
+    "lint": "tsc --noEmit && eslint src",
+    "test": "vitest run",
+    "test:dev": "vitest",
+    "format": "prettier --write src",
+    "prepare": "husky"
+  },
+  "keywords": [
+    "cli",
+    "terminal",
+    "ink",
+    "react",
+    "typescript",
+    "claude",
+    "claude-code",
+    "customize",
+    "installation",
+    "theme",
+    "claude-code-theme",
+    "system-prompts",
+    "toolsets"
+  ],
+  "author": {
+    "name": "Piebald LLC",
+    "email": "support@piebald.ai",
+    "url": "https://piebald.ai"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Piebald-AI/tweakcc.git"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.33.0",
+    "@types/node": "^20.19.10",
+    "@types/react": "^19.1.1",
+    "@types/which": "^3.0.4",
+    "eslint": "^9.33.0",
+    "eslint-plugin-react": "^7.37.5",
+    "globals": "^16.3.0",
+    "husky": "^9.1.7",
+    "lint-staged": "^16.2.7",
+    "prettier": "^3.6.2",
+    "tsdown": "^0.18.4",
+    "tsx": "^4.20.3",
+    "typescript": "^5.9.2",
+    "typescript-eslint": "^8.39.0",
+    "vitest": "^3.2.4"
+  },
+  "lint-staged": {
+    "*.{ts,tsx}": "prettier --write",
+    "*.{json,md}": "prettier --write"
+  },
+  "dependencies": {
+    "chalk": "^5.5.0",
+    "cli-spinners": "^3.4.0",
+    "commander": "^14.0.0",
+    "diff": "^8.0.3",
+    "globby": "^14.1.0",
+    "gray-matter": "^4.0.3",
+    "ink": "^6.1.0",
+    "node-lief": "^1.3.2",
+    "oxfmt": "^0.28.0",
+    "react": "^19.1.1",
+    "string-width": "^8.1.0",
+    "terminal-link": "^3.0.0",
+    "which": "^6.0.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

@@ -1,0 +1,124 @@
+// Please see the note about writing patches in ./index
+
+import { escapeIdent, showDiff } from './index';
+
+// Models to inject/make available.
+// prettier-ignore
+export const CUSTOM_MODELS: { value: string; label: string; description: string }[] = [
+  { value: 'claude-opus-4-6',              label: 'Opus 4.6',             description: "Claude Opus 4.6 (February 2026)" },
+  { value: 'claude-sonnet-4-6',            label: 'Sonnet 4.6',           description: "Claude Sonnet 4.6 (February 2026)" },
+  { value: 'claude-haiku-4-5-20251001',    label: 'Haiku 4.5',            description: "Claude Haiku 4.5 (October 2025)" },
+  { value: 'claude-opus-4-5-20251101',     label: 'Opus 4.5',             description: "Claude Opus 4.5 (November 2025)" },
+  { value: 'claude-sonnet-4-5-20250929',   label: 'Sonnet 4.5',          description: "Claude Sonnet 4.5 (September 2025)" },
+  { value: 'claude-opus-4-1-20250805',     label: 'Opus 4.1',             description: "Claude Opus 4.1 (August 2025)" },
+  { value: 'claude-opus-4-20250514',      label: 'Opus 4',               description: "Claude Opus 4 (May 2025)" },
+  { value: 'claude-sonnet-4-20250514',    label: 'Sonnet 4',             description: "Claude Sonnet 4 (May 2025)" },
+  { value: 'claude-3-7-sonnet-20250219',  label: 'Sonnet 3.7',           description: "Claude 3.7 Sonnet (February 2025)" },
+  { value: 'claude-3-5-sonnet-20241022',  label: 'Sonnet 3.5 (October)', description: "Claude 3.5 Sonnet (October 2024)" },
+  { value: 'claude-3-5-haiku-20241022',   label: 'Haiku 3.5',            description: "Claude 3.5 Haiku (October 2024)" },
+  { value: 'claude-3-5-sonnet-20240620',  label: 'Sonnet 3.5 (June)',    description: "Claude 3.5 Sonnet (June 2024)" },
+  { value: 'claude-3-haiku-20240307',     label: 'Haiku 3',              description: "Claude 3 Haiku (March 2024)" },
+  { value: 'claude-3-opus-20240229',      label: 'Opus 3',               description: "Claude 3 Opus (February 2024)" },
+];
+
+const findCustomModelListInsertionPoint = (
+  fileContents: string
+): { insertionIndex: number; modelListVar: string } | null => {
+  // 1. Find the custom model push pattern
+  const pushPattern =
+    /[,;{} ]([$\w]+)\.push\(\{value:[$\w]+,label:[$\w]+,description:"Custom model"\}\)/;
+  const pushMatch = fileContents.match(pushPattern);
+  if (!pushMatch || pushMatch.index === undefined) {
+    console.error(
+      'patch: findCustomModelListInsertionPoint: failed to find custom model push'
+    );
+    return null;
+  }
+
+  // 2. Extract the model list variable name
+  const modelListVar = pushMatch[1];
+
+  // The declaration/function head can move farther from the push site across CC builds
+  // and when other patches expand this block (notably opusplan1m, which injects ~400
+  // bytes BEFORE the custom-model push inside the same function), so keep a generous
+  // lookback window. On CC 2.1.140 the head sits ~1500 bytes from the push BEFORE
+  // opusplan1m runs and ~1530 bytes after, so 5000 leaves comfortable slack for
+  // future CC builds and additional pre-patches.
+  const searchStart = Math.max(0, pushMatch.index - 5000);
+  const chunk = fileContents.slice(searchStart, pushMatch.index);
+
+  // Declaration can be emitted as let/var/const depending on minifier output,
+  // or as one variable in a comma-separated declaration list.
+  const declPattern = `(?:(?:let|var|const) |,)${escapeIdent(modelListVar)}=.+?;`;
+  const funcPattern = new RegExp(
+    `function [$\\w]+\\([^)]*\\)\\{[\\s\\S]{0,5000}?${declPattern}`,
+    'g'
+  );
+  let lastMatch: RegExpExecArray | null = null;
+  let match: RegExpExecArray | null;
+  while ((match = funcPattern.exec(chunk)) !== null) {
+    lastMatch = match;
+  }
+
+  if (!lastMatch) {
+    console.error(
+      `patch: findCustomModelListInsertionPoint: failed to find function with ${modelListVar}`
+    );
+    return null;
+  }
+
+  // 5. Return index after the semicolon (end of the match), and the var name
+  const insertionIndex = searchStart + lastMatch.index + lastMatch[0].length;
+  return { insertionIndex, modelListVar };
+};
+
+/**
+ * CC 2.1.2xx builds the /model options from a served catalog, then appends
+ * env/settings extras and finally sorts disabled entries last before
+ * resolving the current selection:
+ *   …s.push({…ml(N)…,sessionTail:!0})}s=i2(s,n);let E=null,T=oh(),A=y0();…
+ *   …return s.push({...ml(E)??{value:E,label:E,description:"Custom model"},sessionTail:!0}),xo(s,n)}}
+ * Append the extra models (skipping any already offered) just before that
+ * sort, so they go through the same disabled-last ordering.
+ */
+const writeModelCustomizationsServedCatalog = (
+  oldFile: string
+): string | null => {
+  const sortPattern =
+    /([;}])([$\w]+)=[$\w]+\(\2,[$\w]+\);let [$\w]+=null,[$\w]+=[$\w]+\(\),[$\w]+=[$\w]+\(\);/g;
+  const candidates = [...oldFile.matchAll(sortPattern)].filter(match =>
+    oldFile
+      .slice(match.index!, match.index! + 2500)
+      .includes('description:"Custom model"')
+  );
+  if (candidates.length !== 1) {
+    console.error(
+      'patch: findCustomModelListInsertionPoint: failed to find custom model push'
+    );
+    return null;
+  }
+  const [, delimiter, listVar] = candidates[0];
+  const insertionIndex = candidates[0].index! + delimiter.length;
+  const inject = `for(const tweakccModel of ${JSON.stringify(CUSTOM_MODELS)})if(!${listVar}.some(tweakccExisting=>tweakccExisting.value===tweakccModel.value))${listVar}.push(tweakccModel);`;
+  const newFile =
+    oldFile.slice(0, insertionIndex) + inject + oldFile.slice(insertionIndex);
+  showDiff(oldFile, newFile, inject, insertionIndex, insertionIndex);
+  return newFile;
+};
+
+export const writeModelCustomizations = (oldFile: string): string | null => {
+  const found = findCustomModelListInsertionPoint(oldFile);
+  if (!found) return writeModelCustomizationsServedCatalog(oldFile);
+
+  const { insertionIndex, modelListVar } = found;
+
+  // Build the injection: push each custom model onto the list
+  const inject = CUSTOM_MODELS.map(
+    model => `${modelListVar}.push(${JSON.stringify(model)});`
+  ).join('');
+
+  const newFile =
+    oldFile.slice(0, insertionIndex) + inject + oldFile.slice(insertionIndex);
+  showDiff(oldFile, newFile, inject, insertionIndex, insertionIndex);
+  return newFile;
+};

@@ -1,0 +1,1993 @@
+import * as fs from 'node:fs/promises';
+import * as path from 'path';
+import matter from 'gray-matter';
+import {
+  downloadStringsFile,
+  PromptsNotPublishedError,
+} from './systemPromptDownload';
+import {
+  storeHashes,
+  getPromptHash,
+  computeMD5Hash,
+} from './systemPromptHashIndex';
+import chalk from 'chalk';
+import { PROMPT_CACHE_DIR, SYSTEM_PROMPTS_DIR } from './config';
+import { debug } from './utils';
+
+/**
+ * Prompt structure from strings-X.Y.Z.json files
+ */
+export interface StringsPrompt {
+  name: string;
+  id: string;
+  description: string;
+  pieces: string[];
+  identifiers: number[]; // Can be numbers in JSON or strings when parsed
+  identifierMap: Record<string, string>;
+  version: string;
+}
+
+/**
+ * Structure of downloaded strings file
+ */
+export interface StringsFile {
+  version: string;
+  prompts: StringsPrompt[];
+}
+
+/**
+ * Markdown file frontmatter structure (what users see and edit)
+ */
+export interface MarkdownPrompt {
+  name: string;
+  description: string;
+  ccVersion: string; // CC version this prompt is based on
+  variables?: string[]; // Available variables extracted from identifierMap
+  content: string; // The actual prompt content with ${VARIABLE_NAME} placeholders
+  /**
+   * Line offset of the first content line within the original markdown file.
+   * This counts how many lines (including frontmatter and delimiters) appear
+   * before the first character of `content`, so we can map content-relative
+   * line numbers back to real file line numbers when reporting errors.
+   */
+  contentLineOffset: number;
+}
+
+/**
+ * Result of syncing a single prompt
+ */
+export interface SyncResult {
+  id: string;
+  name: string;
+  description: string;
+  action: 'created' | 'updated' | 'skipped' | 'conflict';
+  oldVersion?: string;
+  newVersion: string;
+  diffHtmlPath?: string;
+}
+
+/**
+ * Overall sync results
+ */
+export interface SyncSummary {
+  ccVersion: string;
+  results: SyncResult[];
+}
+
+/**
+ * Parses markdown file with YAML frontmatter using gray-matter
+ * Uses HTML comment delimiters to avoid conflicts with markdown content
+ */
+export const parseMarkdownPrompt = (markdown: string): MarkdownPrompt => {
+  const parsed = matter(markdown, {
+    delimiters: ['<!--', '-->'],
+  });
+  const { name, description, ccVersion, variables } = parsed.data;
+
+  // Compute how many lines appear before the start of parsed.content in the
+  // original markdown. This lets us translate content-relative line numbers
+  // (starting at 1 for the first line of `parsed.content.trim()`) back to
+  // absolute file line numbers for error reporting.
+  let contentLineOffset = 0;
+  const contentIndex = markdown.indexOf(parsed.content);
+  if (contentIndex >= 0) {
+    const prefix = markdown.slice(0, contentIndex);
+    // Number of newline characters before the first character of content
+    contentLineOffset = prefix.split('\n').length - 1;
+  }
+
+  return {
+    name: name || '',
+    description: description || '',
+    ccVersion: ccVersion || '',
+    variables: variables || [],
+    content: parsed.content,
+    contentLineOffset,
+  };
+};
+
+/**
+ * Generates markdown file content from a prompt using gray-matter
+ * Uses HTML comment delimiters to avoid conflicts with markdown content
+ */
+export const generateMarkdownFromPrompt = (
+  prompt: StringsPrompt,
+  customContent?: string
+): string => {
+  // Reconstruct content from pieces or use custom content
+  const content =
+    customContent ||
+    reconstructContentFromPieces(
+      prompt.pieces,
+      prompt.identifiers,
+      prompt.identifierMap
+    );
+
+  // Extract unique variables from identifierMap
+  const variables =
+    Object.keys(prompt.identifierMap).length > 0
+      ? [...new Set(Object.values(prompt.identifierMap))]
+      : undefined;
+
+  // Build frontmatter data
+  const frontmatterData: Record<string, string | string[]> = {
+    name: prompt.name,
+    description: prompt.description,
+    ccVersion: prompt.version,
+  };
+
+  if (variables && variables.length > 0) {
+    frontmatterData.variables = variables;
+  }
+
+  // Pass the content as a file object rather than a raw string. matter.stringify
+  // re-parses a string argument as front matter first, so content that itself
+  // begins with "<!--" (e.g. an HTML template) collides with the "<!--"/"-->"
+  // delimiters and is mis-parsed as YAML — either throwing or corrupting the
+  // body. A file object skips that re-parse and stringifies the content verbatim.
+  return matter.stringify({ content }, frontmatterData, {
+    delimiters: ['<!--', '-->'],
+  });
+};
+
+/**
+ * Decodes the JavaScript string-literal escapes that mean the same thing in
+ * every literal type: `\"` and `\'`. Both evaluate to the bare quote whether the
+ * prompt lives in a double-quoted, single-quoted or template literal, so they
+ * can be decoded without knowing the delimiter (which is only discoverable at
+ * apply time, from the bundle).
+ *
+ * Deliberately NOT decoded, because re-escaping them IS delimiter-dependent:
+ * - `\\`  applySystemPrompts doubles backslashes for `"`/`'` prompts but not for
+ *         backtick ones (#870). 36 of the 2.1.220 prompts are template literals
+ *         carrying `\\` that has to reach the bundle untouched.
+ * - `` \` `` only meaningful in a template literal, and re-escaped by a separate
+ *         delimiter-specific pass (escapeDepthZeroBackticks).
+ * - `\${` an escaped interpolation is inert on purpose; decoding it would turn
+ *         inert text into a live interpolation.
+ *
+ * Only template text is decoded, including the text of a template literal
+ * nested in an interpolation. Elsewhere inside a `${...}` interpolation the
+ * text is JavaScript, where `\'` escapes a quote of a nested string literal;
+ * decoding it there would leave escapeDepthZeroBackticks with an unclosed
+ * string, and applySystemPrompts would then skip the prompt. Where the
+ * interpolations are is decided by scanTemplateBody, the walker
+ * escapeDepthZeroBackticks itself uses (#922). Decoding a quote in template
+ * text cannot change that walker's state: in template text it reacts only to
+ * `${` and backticks.
+ */
+const decodeQuoteEscapes = (text: string): string => {
+  const { kinds } = scanTemplateBody(text);
+  let out = '';
+  for (let i = 0; i < text.length; i++) {
+    const next = text[i + 1];
+    if (
+      text[i] === '\\' &&
+      (next === '"' || next === "'") &&
+      (kinds[i] === BodyChar.Text || kinds[i] === BodyChar.NestedText) &&
+      countPrecedingBackslashes(text, i) % 2 === 0
+    ) {
+      continue;
+    }
+    out += text[i];
+  }
+  return out;
+};
+
+/**
+ * Reconstructs full content string from pieces array with ${HUMAN_NAME} placeholders
+ *
+ * Pieces are raw JavaScript string-literal source. Quote escapes are decoded
+ * here so that every representation derived from them (the generated markdown,
+ * the diff baselines, and the content hashes used for conflict detection) shows
+ * the prompt text rather than JS syntax (#921, #922). The raw `pieces` are untouched,
+ * so buildSearchRegexFromPieces still matches the bundle's escaped form.
+ */
+export const reconstructContentFromPieces = (
+  pieces: string[],
+  identifiers: (number | string)[],
+  identifierMap: Record<string, string>
+): string => {
+  let result = '';
+
+  for (let i = 0; i < pieces.length; i++) {
+    result += pieces[i];
+
+    // Add the identifier placeholder if there's a corresponding identifier
+    if (i < identifiers.length) {
+      const labelIndex = identifiers[i];
+      const humanName =
+        identifierMap[String(labelIndex)] || `UNKNOWN_${labelIndex}`;
+      result += humanName;
+    }
+  }
+
+  return decodeQuoteEscapes(result);
+};
+
+/**
+ * Builds a regex pattern from pieces array to extract user customizations
+ * Returns a regex that will capture what the user put in place of each ${HUMAN_NAME}
+ */
+export const buildRegexFromPieces = (pieces: string[]): RegExp => {
+  let pattern = '';
+
+  for (let i = 0; i < pieces.length; i++) {
+    // Escape special regex characters in the text piece
+    const escapedPiece = pieces[i].replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    pattern += escapedPiece;
+
+    // Add capture group for content between pieces (what user customized)
+    if (i < pieces.length - 1) {
+      // Capture everything until the next piece starts (non-greedy)
+      pattern += '([\\s\\S]*?)';
+    }
+  }
+
+  return new RegExp(pattern);
+};
+
+/**
+ * Extracts user customizations from their markdown content by matching against pieces
+ * Returns an array of what the user wrote in place of each placeholder
+ */
+export const extractUserCustomizations = (
+  userContent: string,
+  pieces: string[]
+): string[] => {
+  const regex = buildRegexFromPieces(pieces);
+  const match = userContent.match(regex);
+
+  if (!match) {
+    throw new Error(
+      'User content does not match expected structure from pieces'
+    );
+  }
+
+  // Return captured groups (skip index 0 which is the full match)
+  return match.slice(1);
+};
+
+/**
+ * Builds HUMAN→real identifier mapping from extracted customizations
+ * This maps the human-readable names to what the user actually wrote
+ */
+export const buildHumanToRealMapping = (
+  identifiers: (number | string)[],
+  identifierMap: Record<string, string>,
+  extractedCustomizations: string[]
+): Record<string, string> => {
+  const mapping: Record<string, string> = {};
+  const seenKeys = new Set<string>();
+
+  for (let i = 0; i < identifiers.length; i++) {
+    const labelIndex = identifiers[i];
+    const humanName = identifierMap[String(labelIndex)];
+    const realValue = extractedCustomizations[i];
+
+    if (!humanName) continue; // Skip if no mapping exists
+
+    // Check for duplicate keys with different values
+    if (seenKeys.has(humanName)) {
+      const existingValue = mapping[humanName];
+      if (existingValue !== realValue) {
+        throw new Error(
+          `Conflicting mappings for "${humanName}": "${existingValue}" vs "${realValue}"`
+        );
+      }
+    } else {
+      mapping[humanName] = realValue;
+      seenKeys.add(humanName);
+    }
+  }
+
+  return mapping;
+};
+
+/**
+ * Applies user customizations to a new prompt version
+ * Takes the new prompt's pieces and applies the user's custom mappings
+ */
+export const applyCustomizationsToPrompt = (
+  newPrompt: StringsPrompt,
+  humanToRealMapping: Record<string, string>
+): string => {
+  let result = '';
+
+  for (let i = 0; i < newPrompt.pieces.length; i++) {
+    result += newPrompt.pieces[i];
+
+    if (i < newPrompt.identifiers.length) {
+      const labelIndex = newPrompt.identifiers[i];
+      const humanName = newPrompt.identifierMap[String(labelIndex)];
+
+      // Use user's customization if available, otherwise use the placeholder
+      const value = humanToRealMapping[humanName] ?? `\${${humanName}}`;
+      result += value;
+    }
+  }
+
+  return result;
+};
+
+/**
+ * Compares two version strings
+ * Returns: -1 if v1 < v2, 0 if equal, 1 if v1 > v2
+ */
+export const compareVersions = (v1: string, v2: string): number => {
+  const parts1 = v1.split('.').map(Number);
+  const parts2 = v2.split('.').map(Number);
+
+  for (let i = 0; i < Math.max(parts1.length, parts2.length); i++) {
+    const num1 = parts1[i] || 0;
+    const num2 = parts2[i] || 0;
+
+    if (num1 < num2) return -1;
+    if (num1 > num2) return 1;
+  }
+
+  return 0;
+};
+
+/**
+ * Gets the markdown file path for a prompt (using name, not id)
+ */
+export const getPromptFilePath = (promptId: string): string => {
+  return path.join(SYSTEM_PROMPTS_DIR, `${promptId}.md`);
+};
+
+/**
+ * Checks if a markdown file exists for a prompt
+ */
+export const promptFileExists = async (promptId: string): Promise<boolean> => {
+  try {
+    await fs.access(getPromptFilePath(promptId));
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Reads a markdown prompt file
+ */
+export const readPromptFile = async (
+  promptId: string
+): Promise<MarkdownPrompt> => {
+  const filePath = getPromptFilePath(promptId);
+  const content = await fs.readFile(filePath, 'utf-8');
+  return parseMarkdownPrompt(content);
+};
+
+/**
+ * Writes a markdown prompt file
+ */
+export const writePromptFile = async (
+  promptId: string,
+  content: string
+): Promise<void> => {
+  const filePath = getPromptFilePath(promptId);
+  await fs.writeFile(filePath, content, 'utf-8');
+};
+
+/**
+ * Updates variables list in a markdown file's frontmatter
+ * This ensures the file always has the latest available variables
+ */
+export const updateVariables = async (
+  promptId: string,
+  newIdentifierMap: Record<string, string>
+): Promise<void> => {
+  const filePath = getPromptFilePath(promptId);
+  const markdown = await fs.readFile(filePath, 'utf-8');
+  const parsed = matter(markdown, {
+    delimiters: ['<!--', '-->'],
+  });
+
+  // Extract unique variables from identifierMap
+  const variables =
+    Object.keys(newIdentifierMap).length > 0
+      ? [...new Set(Object.values(newIdentifierMap))]
+      : undefined;
+
+  // Update frontmatter with new variables
+  const updatedData: Record<string, string | string[]> = {
+    name: parsed.data.name,
+    description: parsed.data.description,
+    ccVersion: parsed.data.ccVersion,
+  };
+
+  if (variables && variables.length > 0) {
+    updatedData.variables = variables;
+  }
+
+  // Wrap in a file object so matter.stringify does not re-parse content that
+  // begins with "<!--" as front matter (see generateMarkdownFromPrompt).
+  const updatedMarkdown = matter.stringify(
+    { content: parsed.content },
+    updatedData,
+    {
+      delimiters: ['<!--', '-->'],
+    }
+  );
+  await writePromptFile(promptId, updatedMarkdown);
+};
+
+/**
+ * Computes word-level diff for a single line
+ * Returns HTML with <mark> tags around changed words
+ */
+const computeWordDiff = (
+  oldText: string,
+  newText: string
+): { oldHtml: string; newHtml: string } => {
+  // Split by word boundaries while preserving whitespace
+  const tokenize = (text: string): string[] => {
+    return text.split(/(\s+)/);
+  };
+
+  const oldTokens = tokenize(oldText);
+  const newTokens = tokenize(newText);
+
+  // Build LCS matrix for tokens
+  const m = oldTokens.length;
+  const n = newTokens.length;
+  const lcs: number[][] = Array(m + 1)
+    .fill(0)
+    .map(() => Array(n + 1).fill(0));
+
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      if (oldTokens[i - 1] === newTokens[j - 1]) {
+        lcs[i][j] = lcs[i - 1][j - 1] + 1;
+      } else {
+        lcs[i][j] = Math.max(lcs[i - 1][j], lcs[i][j - 1]);
+      }
+    }
+  }
+
+  // Backtrack to identify changed tokens
+  const oldChanged: boolean[] = Array(m).fill(false);
+  const newChanged: boolean[] = Array(n).fill(false);
+  let i = m;
+  let j = n;
+
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && oldTokens[i - 1] === newTokens[j - 1]) {
+      i--;
+      j--;
+    } else if (j > 0 && (i === 0 || lcs[i][j - 1] >= lcs[i - 1][j])) {
+      newChanged[j - 1] = true;
+      j--;
+    } else if (i > 0) {
+      oldChanged[i - 1] = true;
+      i--;
+    }
+  }
+
+  // Build HTML with highlights
+  const escapeHtml = (text: string) =>
+    text
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#039;');
+
+  let oldHtml = '';
+  for (let k = 0; k < oldTokens.length; k++) {
+    const token = escapeHtml(oldTokens[k]);
+    oldHtml += oldChanged[k] ? `<mark>${token}</mark>` : token;
+  }
+
+  let newHtml = '';
+  for (let k = 0; k < newTokens.length; k++) {
+    const token = escapeHtml(newTokens[k]);
+    newHtml += newChanged[k] ? `<mark>${token}</mark>` : token;
+  }
+
+  return { oldHtml, newHtml };
+};
+
+/**
+ * Simple LCS-based diff algorithm to compute line differences
+ */
+const computeDiff = (
+  oldLines: string[],
+  newLines: string[]
+): Array<{
+  type: 'unchanged' | 'removed' | 'added' | 'modified';
+  line: string;
+  oldLineNo?: number;
+  newLineNo?: number;
+  oldHtml?: string;
+  newHtml?: string;
+}> => {
+  // Build LCS (Longest Common Subsequence) matrix
+  const m = oldLines.length;
+  const n = newLines.length;
+  const lcs: number[][] = Array(m + 1)
+    .fill(0)
+    .map(() => Array(n + 1).fill(0));
+
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      if (oldLines[i - 1] === newLines[j - 1]) {
+        lcs[i][j] = lcs[i - 1][j - 1] + 1;
+      } else {
+        lcs[i][j] = Math.max(lcs[i - 1][j], lcs[i][j - 1]);
+      }
+    }
+  }
+
+  // Backtrack to build diff with word-level highlighting
+  const diff: Array<{
+    type: 'unchanged' | 'removed' | 'added' | 'modified';
+    line: string;
+    oldLineNo?: number;
+    newLineNo?: number;
+    oldHtml?: string;
+    newHtml?: string;
+  }> = [];
+  let i = m;
+  let j = n;
+
+  const tempDiff: Array<{
+    type: 'unchanged' | 'removed' | 'added';
+    line: string;
+    oldLineNo?: number;
+    newLineNo?: number;
+  }> = [];
+
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && oldLines[i - 1] === newLines[j - 1]) {
+      tempDiff.unshift({
+        type: 'unchanged',
+        line: oldLines[i - 1],
+        oldLineNo: i,
+        newLineNo: j,
+      });
+      i--;
+      j--;
+    } else if (j > 0 && (i === 0 || lcs[i][j - 1] >= lcs[i - 1][j])) {
+      tempDiff.unshift({ type: 'added', line: newLines[j - 1], newLineNo: j });
+      j--;
+    } else if (i > 0) {
+      tempDiff.unshift({
+        type: 'removed',
+        line: oldLines[i - 1],
+        oldLineNo: i,
+      });
+      i--;
+    }
+  }
+
+  // Post-process to detect modified lines (adjacent removed+added pairs)
+  for (let k = 0; k < tempDiff.length; k++) {
+    const current = tempDiff[k];
+    const next = tempDiff[k + 1];
+
+    if (current.type === 'removed' && next?.type === 'added') {
+      // Adjacent removed/added = modified line with word diff
+      const wordDiff = computeWordDiff(current.line, next.line);
+      diff.push({
+        type: 'modified',
+        line: current.line,
+        oldLineNo: current.oldLineNo,
+        newLineNo: next.newLineNo,
+        oldHtml: wordDiff.oldHtml,
+        newHtml: wordDiff.newHtml,
+      });
+      k++; // Skip next since we consumed it
+    } else {
+      diff.push(current);
+    }
+  }
+
+  return diff;
+};
+
+/**
+ * Generates an HTML diff file showing differences between old and new versions
+ * Shows TWO diffs side-by-side:
+ * - Left: oldcc ↔ user customizations (what the user changed)
+ * - Right: oldcc ↔ newcc (what changed upstream)
+ * Returns the path to the generated HTML file
+ */
+export const generateDiffHtml = async (
+  promptId: string,
+  promptName: string,
+  oldBaselineContent: string,
+  userContent: string,
+  newBaselineContent: string,
+  oldVersion: string,
+  newVersion: string,
+  markdownFilePath: string
+): Promise<string> => {
+  const oldBaselineLines = oldBaselineContent.split('\n');
+  const userLines = userContent.split('\n');
+  const newBaselineLines = newBaselineContent.split('\n');
+
+  const escapeHtml = (text: string) =>
+    text
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#039;');
+
+  // Compute BOTH diffs
+  const userDiff = computeDiff(oldBaselineLines, userLines); // oldcc -> user
+  const upstreamDiff = computeDiff(oldBaselineLines, newBaselineLines); // oldcc -> newcc
+
+  // Generate left diff HTML (user customizations)
+  let userDiffHtml = '';
+  for (const entry of userDiff) {
+    const escapedLine = escapeHtml(entry.line);
+    if (entry.type === 'modified') {
+      // Show both old and new lines with word-level highlighting
+      const oldLineNum = entry.oldLineNo
+        ? String(entry.oldLineNo).padStart(4, ' ')
+        : '    ';
+      const newLineNum = entry.newLineNo
+        ? String(entry.newLineNo).padStart(4, ' ')
+        : '    ';
+      userDiffHtml += `<div class="line removed"><span class="line-num">${oldLineNum}</span><span class="prefix">- </span>${entry.oldHtml}</div>\n`;
+      userDiffHtml += `<div class="line added"><span class="line-num">${newLineNum}</span><span class="prefix">+ </span>${entry.newHtml}</div>\n`;
+    } else if (entry.type === 'removed') {
+      const lineNum = entry.oldLineNo
+        ? String(entry.oldLineNo).padStart(4, ' ')
+        : '    ';
+      userDiffHtml += `<div class="line removed"><span class="line-num">${lineNum}</span><span class="prefix">- </span>${escapedLine}</div>\n`;
+    } else if (entry.type === 'added') {
+      const lineNum = entry.newLineNo
+        ? String(entry.newLineNo).padStart(4, ' ')
+        : '    ';
+      userDiffHtml += `<div class="line added"><span class="line-num">${lineNum}</span><span class="prefix">+ </span>${escapedLine}</div>\n`;
+    } else {
+      const oldLineNum = entry.oldLineNo
+        ? String(entry.oldLineNo).padStart(4, ' ')
+        : '    ';
+      const newLineNum = entry.newLineNo
+        ? String(entry.newLineNo).padStart(4, ' ')
+        : '    ';
+      userDiffHtml += `<div class="line unchanged"><span class="line-num">${oldLineNum} ${newLineNum}</span><span class="prefix">  </span>${escapedLine}</div>\n`;
+    }
+  }
+
+  // Generate right diff HTML (upstream changes)
+  let upstreamDiffHtml = '';
+  for (const entry of upstreamDiff) {
+    const escapedLine = escapeHtml(entry.line);
+    if (entry.type === 'modified') {
+      // Show both old and new lines with word-level highlighting
+      const oldLineNum = entry.oldLineNo
+        ? String(entry.oldLineNo).padStart(4, ' ')
+        : '    ';
+      const newLineNum = entry.newLineNo
+        ? String(entry.newLineNo).padStart(4, ' ')
+        : '    ';
+      upstreamDiffHtml += `<div class="line removed"><span class="line-num">${oldLineNum}</span><span class="prefix">- </span>${entry.oldHtml}</div>\n`;
+      upstreamDiffHtml += `<div class="line added"><span class="line-num">${newLineNum}</span><span class="prefix">+ </span>${entry.newHtml}</div>\n`;
+    } else if (entry.type === 'removed') {
+      const lineNum = entry.oldLineNo
+        ? String(entry.oldLineNo).padStart(4, ' ')
+        : '    ';
+      upstreamDiffHtml += `<div class="line removed"><span class="line-num">${lineNum}</span><span class="prefix">- </span>${escapedLine}</div>\n`;
+    } else if (entry.type === 'added') {
+      const lineNum = entry.newLineNo
+        ? String(entry.newLineNo).padStart(4, ' ')
+        : '    ';
+      upstreamDiffHtml += `<div class="line added"><span class="line-num">${lineNum}</span><span class="prefix">+ </span>${escapedLine}</div>\n`;
+    } else {
+      const oldLineNum = entry.oldLineNo
+        ? String(entry.oldLineNo).padStart(4, ' ')
+        : '    ';
+      const newLineNum = entry.newLineNo
+        ? String(entry.newLineNo).padStart(4, ' ')
+        : '    ';
+      upstreamDiffHtml += `<div class="line unchanged"><span class="line-num">${oldLineNum} ${newLineNum}</span><span class="prefix">  </span>${escapedLine}</div>\n`;
+    }
+  }
+
+  const diffHtml = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Diff: ${escapeHtml(promptName)} (${escapeHtml(promptId)})</title>
+  <style>
+    body {
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      margin: 0;
+      padding: 20px;
+      background: #f5f5f5;
+    }
+    .header {
+      background: white;
+      padding: 20px;
+      border-radius: 8px;
+      margin-bottom: 20px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    h1 {
+      margin: 0 0 10px 0;
+      color: #333;
+    }
+    .version-info {
+      color: #666;
+      font-size: 14px;
+    }
+    .warning {
+      background: #fff3cd;
+      border-left: 4px solid #ffc107;
+      padding: 15px;
+      margin-bottom: 20px;
+      border-radius: 4px;
+    }
+    .warning code {
+      background: rgba(0,0,0,0.1);
+      padding: 2px 6px;
+      border-radius: 3px;
+      font-family: 'Consolas', 'Monaco', monospace;
+      font-size: 13px;
+    }
+    .diff-panels {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 20px;
+      margin-bottom: 20px;
+    }
+    .diff-container {
+      background: white;
+      border-radius: 8px;
+      overflow: hidden;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    .diff-header {
+      background: #f8f9fa;
+      padding: 12px 15px;
+      font-weight: bold;
+      border-bottom: 2px solid #dee2e6;
+      font-family: 'Consolas', 'Monaco', monospace;
+      font-size: 14px;
+    }
+    .diff-content {
+      padding: 0;
+      font-family: 'Consolas', 'Monaco', monospace;
+      font-size: 13px;
+      line-height: 1.5;
+      overflow-x: auto;
+      max-height: 600px;
+      overflow-y: auto;
+    }
+    .line {
+      padding: 2px 10px;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+    }
+    .line .line-num {
+      display: inline-block;
+      min-width: 50px;
+      margin-right: 10px;
+      color: #6a737d;
+      text-align: right;
+      user-select: none;
+      font-size: 12px;
+    }
+    .line .prefix {
+      display: inline-block;
+      width: 20px;
+      font-weight: bold;
+      user-select: none;
+    }
+    .removed {
+      background: #ffebe9;
+      color: #24292e;
+    }
+    .removed .prefix {
+      color: #d73a49;
+    }
+    .added {
+      background: #e6ffed;
+      color: #24292e;
+    }
+    .added .prefix {
+      color: #22863a;
+    }
+    .unchanged {
+      background: #ffffff;
+      color: #24292e;
+    }
+    .unchanged .prefix {
+      color: #6a737d;
+    }
+    mark {
+      background: rgba(255, 200, 0, 0.4);
+      padding: 0;
+      border-radius: 2px;
+    }
+    .removed mark {
+      background: rgba(215, 58, 73, 0.3);
+    }
+    .added mark {
+      background: rgba(34, 134, 58, 0.3);
+    }
+    @media (max-width: 1200px) {
+      .diff-panels {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>${escapeHtml(promptName)}</h1>
+    <div class="version-info">
+      <strong>Old Version:</strong> ${escapeHtml(oldVersion)} →
+      <strong>New Version:</strong> ${escapeHtml(newVersion)}
+    </div>
+  </div>
+
+  <div class="warning">
+    <strong>⚠️ Version Mismatch Warning</strong><br>
+    Your customized prompt file is based on version ${escapeHtml(oldVersion)},
+    but Claude Code is now using version ${escapeHtml(newVersion)}.
+    Review the differences below to understand both your customizations and the upstream changes.<br><br>
+    <strong>File:</strong> <code>${escapeHtml(markdownFilePath)}</code><br><br>
+    When you're done reviewing, update the <code>ccVersion</code> in the file to <strong>${escapeHtml(newVersion)}</strong>.
+  </div>
+
+  <div class="diff-panels">
+    <div class="diff-container">
+      <div class="diff-header">Your Customizations (v${escapeHtml(oldVersion)} → User)</div>
+      <div class="diff-content">
+${userDiffHtml}      </div>
+    </div>
+
+    <div class="diff-container">
+      <div class="diff-header">Upstream Changes (v${escapeHtml(oldVersion)} → v${escapeHtml(newVersion)})</div>
+      <div class="diff-content">
+${upstreamDiffHtml}      </div>
+    </div>
+  </div>
+</body>
+</html>`;
+
+  // Save to system prompts directory
+  const htmlPath = path.join(SYSTEM_PROMPTS_DIR, `${promptId}.diff.html`);
+  await fs.writeFile(htmlPath, diffHtml, 'utf-8');
+
+  return htmlPath;
+};
+
+/**
+ * Locates each unescaped `${...}` interpolation in a prompt markdown body and
+ * returns the half-open bounds of its inner text. Escaped interpolations
+ * (`\${...}`) are literal text, not real placeholders, so they are skipped.
+ * Braces inside a string or template literal within the interpolation (e.g.
+ * `${"}" + X}`) do not close it — the walker tracks the enclosing quote so a
+ * literal `}` cannot desync the brace depth. A nested interpolation is part of
+ * its enclosing span rather than a span of its own.
+ *
+ * This is the single walker behind both the drift check and the identifier
+ * substitution; #922 records three attempts at a second, divergent copy, all of
+ * which desynchronised against this one.
+ */
+const interpolationSpans = (
+  content: string
+): { start: number; end: number }[] => {
+  const spans: { start: number; end: number }[] = [];
+  for (let i = 0; i < content.length - 1; i++) {
+    if (
+      content[i] === '$' &&
+      content[i + 1] === '{' &&
+      countPrecedingBackslashes(content, i) % 2 === 0
+    ) {
+      let depth = 1;
+      let inString = ''; // '', or the open quote char: ' " `
+      let j = i + 2;
+      const start = j;
+      while (j < content.length && depth > 0) {
+        const ch = content[j];
+        if (inString) {
+          if (
+            ch === inString &&
+            countPrecedingBackslashes(content, j) % 2 === 0
+          )
+            inString = '';
+        } else if (ch === '"' || ch === "'" || ch === '`') {
+          inString = ch;
+        } else if (ch === '{') {
+          depth++;
+        } else if (ch === '}') {
+          depth--;
+        }
+        j++;
+      }
+      // When the loop stops because depth reached 0, `j` is one past the closing
+      // brace, so the inner text ends at j - 1. When it stops because `j` ran off
+      // the end, the interpolation is unterminated and content[j - 1] is real
+      // text, not a delimiter: ending at j - 1 there would drop the last
+      // character and expose a word boundary that does not exist, so a name
+      // ending the content would be substituted when it should not be.
+      // Both cases keep end >= start, so a caller walking spans in order can
+      // never rewind its cursor.
+      spans.push({ start, end: depth === 0 ? j - 1 : j });
+      i = j - 1;
+    }
+  }
+  return spans;
+};
+
+/**
+ * Collects the inner text of each unescaped `${...}` interpolation in a prompt
+ * markdown body.
+ */
+const interpolationRegions = (content: string): string[] =>
+  interpolationSpans(content).map(({ start, end }) =>
+    content.slice(start, end)
+  );
+
+/**
+ * Detects whether a prompt markdown file has drifted from the current identifier
+ * map: an interpolation identifier the current snapshot expects is no longer
+ * referenced in the file's `${...}` interpolations. The extractor sometimes
+ * renames a prompt's identifiers without bumping the per-prompt version (#899),
+ * so the version stamps match while the body still uses the old name. Applying
+ * such a file would inject an undefined identifier into cli.js (#900).
+ *
+ * Identifier names are matched with word boundaries against the interpolation
+ * text only (not the whole body), so a name that also appears in ALL-CAPS prose
+ * (e.g. a "## TOOLS" heading) does not mask a drifted `${TOOLS}`, and a shorter
+ * expected name is not spuriously matched inside a longer surviving token.
+ */
+export const hasIdentifierDrift = (
+  content: string,
+  identifierMap: Record<string, string>
+): boolean => {
+  const expectedNames = Object.values(identifierMap);
+  if (expectedNames.length === 0) return false;
+
+  const interpolationText = interpolationRegions(content).join('\n');
+  return expectedNames.some(name => {
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return !new RegExp(`(?<![\\w$])${escaped}(?![\\w$])`).test(
+      interpolationText
+    );
+  });
+};
+
+/**
+ * Whether the user edited a prompt file: its content no longer hashes to the
+ * text tweakcc wrote for its version.
+ */
+export const isPromptEdited = async (
+  promptId: string,
+  file: MarkdownPrompt
+): Promise<boolean> => {
+  const writtenHash = await getPromptHash(promptId, file.ccVersion);
+  return !writtenHash || writtenHash !== computeMD5Hash(file.content);
+};
+
+/**
+ * Syncs a single prompt file with the current CC version
+ * Similar to ensurePromptFile in config.ts but with version tracking
+ */
+export const syncPrompt = async (
+  prompt: StringsPrompt
+): Promise<SyncResult> => {
+  const result: SyncResult = {
+    id: prompt.id,
+    name: prompt.name,
+    description: prompt.description,
+    action: 'skipped',
+    newVersion: prompt.version,
+  };
+
+  const fileExists = await promptFileExists(prompt.id);
+
+  // File doesn't exist - create it
+  if (!fileExists) {
+    const markdown = generateMarkdownFromPrompt(prompt);
+    await writePromptFile(prompt.id, markdown);
+    result.action = 'created';
+    return result;
+  }
+
+  // File exists - read and update
+  const existingFile = await readPromptFile(prompt.id);
+  result.oldVersion = existingFile.ccVersion;
+
+  // Always update variables list
+  await updateVariables(prompt.id, prompt.identifierMap);
+
+  // Check version comparison
+  if (existingFile.ccVersion && prompt.version) {
+    const versionComparison = compareVersions(
+      existingFile.ccVersion,
+      prompt.version
+    );
+
+    // A matching version stamp usually means the file is up to date. But the
+    // extractor sometimes renames a prompt's interpolation identifiers without
+    // bumping the per-prompt version (#899), so also check for that drift and
+    // treat it like an upgrade; otherwise the stale identifiers get applied and
+    // inject an undefined variable into cli.js (#900).
+    const drifted =
+      versionComparison === 0 &&
+      hasIdentifierDrift(existingFile.content, prompt.identifierMap);
+
+    if (versionComparison === 0 && !drifted) {
+      // Same version and no drift - already updated above
+      result.action = 'skipped';
+      return result;
+    }
+
+    {
+      // The file is out of date: based on an older version, or on the same
+      // version but with drifted identifiers. Check if the user has modified it.
+      const isModified = await isPromptEdited(prompt.id, existingFile);
+
+      if (isModified) {
+        // User has modified the file
+        result.action = 'conflict';
+
+        // Get the old baseline content (unmodified version from old CC version)
+        // We need to reconstruct what the old version looked like
+        // For now, we'll fetch the old strings file to get the baseline
+        let oldBaselineContent = existingFile.content; // Default fallback
+        try {
+          const oldStringsFile = await downloadStringsFile(
+            existingFile.ccVersion
+          );
+          const oldPrompt = oldStringsFile.prompts.find(
+            p => p.id === prompt.id
+          );
+
+          if (oldPrompt) {
+            oldBaselineContent = reconstructContentFromPieces(
+              oldPrompt.pieces,
+              oldPrompt.identifiers,
+              oldPrompt.identifierMap
+            );
+          }
+        } catch {
+          // If we can't download the old version, just use existing content as baseline
+          console.log(
+            chalk.yellow(
+              `Warning: Could not fetch old version ${existingFile.ccVersion} for comparison. Using current file as baseline.`
+            )
+          );
+        }
+
+        // Get the new baseline content
+        const newBaselineContent = reconstructContentFromPieces(
+          prompt.pieces,
+          prompt.identifiers,
+          prompt.identifierMap
+        );
+
+        const markdownFilePath = getPromptFilePath(prompt.id);
+        const diffPath = await generateDiffHtml(
+          prompt.id,
+          prompt.name,
+          oldBaselineContent,
+          existingFile.content, // User's current content
+          newBaselineContent,
+          existingFile.ccVersion,
+          prompt.version,
+          markdownFilePath
+        );
+        result.diffHtmlPath = diffPath;
+      } else {
+        // User has NOT modified the file - automatically upgrade it
+        const newMarkdown = generateMarkdownFromPrompt(prompt);
+        await writePromptFile(prompt.id, newMarkdown);
+        result.action = 'updated';
+      }
+    }
+  }
+
+  return result;
+};
+
+/**
+ * Main sync function - downloads strings for current CC version and syncs all prompts
+ */
+export const syncSystemPrompts = async (
+  ccVersion: string
+): Promise<SyncSummary> => {
+  const summary: SyncSummary = {
+    ccVersion,
+    results: [],
+  };
+
+  // Download strings file for current CC version
+  const stringsFile = (await loadStringsFile(ccVersion)).file;
+
+  // Store hashes for all prompts in this version
+  await storeHashes(stringsFile);
+
+  // Ensure system prompts directory exists
+  await fs.mkdir(SYSTEM_PROMPTS_DIR, { recursive: true });
+
+  // Sync each prompt
+  for (const prompt of stringsFile.prompts) {
+    try {
+      const result = await syncPrompt(prompt);
+      summary.results.push(result);
+    } catch (error) {
+      console.log(chalk.red(`Failed to sync prompt ${prompt.id}:`));
+      throw error;
+    }
+  }
+
+  return summary;
+};
+
+/** Earlier patch versions tried when looking for prompt data to fall back on. */
+const EARLIER_PATCH_VERSIONS = 10;
+
+/**
+ * The prompts file of the newest earlier Claude Code version: one of the
+ * previous patch versions (cached or published), else the newest cached file.
+ */
+const findEarlierStringsFile = async (
+  version: string
+): Promise<{ version: string; file: StringsFile } | null> => {
+  const [major, minor, patch] = version.split('.').map(Number);
+  for (let p = patch - 1; p >= 0 && p >= patch - EARLIER_PATCH_VERSIONS; p--) {
+    const earlier = `${major}.${minor}.${p}`;
+    try {
+      return { version: earlier, file: await downloadStringsFile(earlier) };
+    } catch (error) {
+      // Offline or rate-limited: only the cache can help.
+      if (!(error instanceof PromptsNotPublishedError)) break;
+    }
+  }
+
+  let cached: string[];
+  try {
+    cached = await fs.readdir(PROMPT_CACHE_DIR);
+  } catch {
+    return null;
+  }
+  const earlierCached = cached
+    .map(name => /^prompts-(\d+\.\d+\.\d+)\.json$/.exec(name)?.[1])
+    .filter(
+      (v): v is string => v !== undefined && compareVersions(v, version) < 0
+    )
+    .sort((a, b) => compareVersions(b, a));
+  for (const earlier of earlierCached) {
+    try {
+      const cachedFile = path.join(PROMPT_CACHE_DIR, `prompts-${earlier}.json`);
+      const file = JSON.parse(await fs.readFile(cachedFile, 'utf-8'));
+      return { version: earlier, file: file as StringsFile };
+    } catch {
+      // Unreadable cache file: try the next one.
+    }
+  }
+  return null;
+};
+
+/**
+ * The prompts file for a Claude Code version. Until tweakcc publishes one,
+ * the newest earlier file is used instead: every prompt whose text did not
+ * change is still found and patched. `dataVersion` is the version the file
+ * belongs to.
+ */
+export const loadStringsFile = async (
+  version: string
+): Promise<{ file: StringsFile; dataVersion: string }> => {
+  try {
+    return { file: await downloadStringsFile(version), dataVersion: version };
+  } catch (error) {
+    if (!(error instanceof PromptsNotPublishedError)) throw error;
+    const earlier = await findEarlierStringsFile(version);
+    if (!earlier) throw error;
+    return { file: earlier.file, dataVersion: earlier.version };
+  }
+};
+
+// Global cache for downloaded strings file to avoid multiple downloads
+// This is loaded once at app startup and reused throughout the session
+let globalStringsFile: StringsFile | null = null;
+let globalCachedVersion: string | null = null;
+let globalDataVersion: string | null = null;
+
+/** The Claude Code version of the preloaded prompt data. */
+export const getPromptDataVersion = (): string | null => globalDataVersion;
+
+/**
+ * Preloads the strings file for a given version into global cache
+ * Should be called once at app startup
+ * Returns an object with success status and optional error message
+ * @param version - Version string to preload
+ */
+export const preloadStringsFile = async (
+  version: string
+): Promise<{ success: boolean; errorMessage?: string }> => {
+  try {
+    const { file, dataVersion } = await loadStringsFile(version);
+    globalStringsFile = file;
+    globalCachedVersion = version;
+    globalDataVersion = dataVersion;
+    if (dataVersion !== version) {
+      console.log(
+        chalk.yellow(
+          `tweakcc has no prompt data for Claude Code ${version} yet; using the ${dataVersion} data, so prompts that changed in ${version} are left as they are.`
+        )
+      );
+    }
+    return { success: true };
+  } catch (error) {
+    // If download fails, just leave global cache as null
+    globalStringsFile = null;
+    globalCachedVersion = null;
+    globalDataVersion = null;
+
+    // Return the error message for display
+    if (error instanceof Error) {
+      return { success: false, errorMessage: error.message };
+    }
+    return {
+      success: false,
+      errorMessage: 'Unknown error occurred while downloading system prompts',
+    };
+  }
+};
+
+/**
+ * System prompt definition for listing
+ */
+export interface SystemPromptDefinition {
+  id: string;
+  name: string;
+  description: string;
+}
+
+/**
+ * Returns the list of all available system prompts for a given CC version.
+ * Requires preloadStringsFile to be called first.
+ * Used by --list-system-prompts flag.
+ */
+export const getSystemPromptDefinitions = ():
+  | SystemPromptDefinition[]
+  | null => {
+  if (!globalStringsFile) {
+    return null;
+  }
+
+  return globalStringsFile.prompts.map(prompt => ({
+    id: prompt.id,
+    name: prompt.name,
+    description: prompt.description,
+  }));
+};
+
+/**
+ * Builds a regex pattern from pieces array that will match the original content in cli.js.
+ * The regex captures the actual variable names used in the current CC version.
+ *
+ * Pieces are split at identifier boundaries, so:
+ * - pieces[i] contains text ending with ${ (or no ${ for last piece)
+ * - identifier appears between pieces[i] and pieces[i+1]
+ * - pieces[i+1] starts with text after the identifier (e.g., .method(), }, etc.)
+ *
+ * We only capture the bare identifier, not the surrounding ${} or any method calls.
+ */
+/**
+ * Converts non-ASCII characters to regex alternation patterns that match both
+ * literal and Unicode-escaped forms (e.g., … matches both "…" and "\u2026").
+ * This handles cases where cli.js has escaped Unicode characters.
+ */
+const escapeNonAsciiForRegex = (text: string): string => {
+  // eslint-disable-next-line no-control-regex
+  return text.replace(/[^\x00-\x7F]/g, char => {
+    const codePoint = char.charCodeAt(0);
+    const literal = char.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // Match the literal char OR its escaped forms. Minified bundles store BMP
+    // non-ASCII as \uXXXX, but Latin-1 chars (0x80–0xFF) are emitted as \xHH
+    // (2-digit hex, e.g. "·" -> \xB7, "×" -> \xD7). The search regex's 'i' flag
+    // handles upper/lowercase hex. Without the \xHH alternative, any prompt
+    // containing such a character (·, ×, °, é, …) fails to match on recent
+    // Claude Code builds, so the whole prompt is skipped.
+    const alts = [literal, `\\\\u${codePoint.toString(16).padStart(4, '0')}`];
+    if (codePoint >= 0x80 && codePoint <= 0xff) {
+      alts.push(`\\\\x${codePoint.toString(16).padStart(2, '0')}`);
+    }
+    return `(?:${alts.join('|')})`;
+  });
+};
+
+/**
+ * Converts non-ASCII characters to Unicode escape sequences (\uXXXX).
+ * Used when writing prompts back to cli.js for environments that only support ASCII.
+ */
+/**
+ * Encode non-ASCII as `\uXXXX` for Bun native executables, whose embedded
+ * module is Latin-1 (#853).
+ *
+ * This emits JavaScript *syntax*, so it has to run after any pass that escapes
+ * literal backslashes in the prompt's own text. Running it first lets the
+ * backslash-doubling from #664 turn `—` into `\\u2014`, which is a literal
+ * backslash followed by `u2014` rather than an em dash (#920).
+ */
+export const escapeNonAsciiChars = (text: string): string => {
+  // eslint-disable-next-line no-control-regex
+  return text.replace(/[^\x00-\x7F]/g, char => {
+    const codePoint = char.charCodeAt(0);
+    return `\\u${codePoint.toString(16).padStart(4, '0')}`;
+  });
+};
+
+/**
+ * A serialized build-path property, including its JS string delimiters. Bun
+ * rewrites the npm-relative hook worker path into a virtual-filesystem path.
+ * Keep this non-capturing: identifier captures are positional and adding a group
+ * here would silently map every subsequent prompt variable to the wrong value.
+ * Escaped characters are allowed, but raw quotes/newlines cannot cross a field.
+ */
+const HOOKS_WORKER_URL_PROPERTY = String.raw`HOOKS_WORKER_URL:"(?:\\[^\r\n]|[^"\\\r\n])*"`;
+
+/**
+ * Retains the target build's worker URL when an otherwise edited prompt embeds
+ * build metadata. Only an unchanged snapshot property is substituted; an
+ * explicitly edited property is left alone. Ambiguous/missing metadata is not
+ * guessed. Replacement callbacks preserve dollar signs in Bun's /$bunfs paths.
+ */
+const preserveMatchedWorkerUrl = (
+  content: string,
+  pieces: string[],
+  matchedContent: string
+): string => {
+  const original = pieces.flatMap(piece =>
+    [...piece.matchAll(new RegExp(HOOKS_WORKER_URL_PROPERTY, 'g'))].map(
+      match => match[0]
+    )
+  );
+  const actual = [
+    ...matchedContent.matchAll(new RegExp(HOOKS_WORKER_URL_PROPERTY, 'g')),
+  ];
+  if (original.length !== 1 || actual.length !== 1) return content;
+  // Build metadata is executable code inside a live interpolation. A user can
+  // quote the same property in prose to explain it; that text is not metadata
+  // and must not be rewritten along with the build object's actual property.
+  let result = '';
+  let cursor = 0;
+  for (const { start, end } of interpolationSpans(content)) {
+    result += content.slice(cursor, start);
+    result += content
+      .slice(start, end)
+      .replace(new RegExp(HOOKS_WORKER_URL_PROPERTY, 'g'), property =>
+        property === original[0] ? actual[0][0] : property
+      );
+    cursor = end;
+  }
+  return result + content.slice(cursor);
+};
+
+/**
+ * Builds a prompt matcher with positional identifier captures. Build-specific
+ * hook worker paths may differ, but all surrounding metadata remains literal.
+ * The matched path must be preserved by the replacement pipeline below.
+ */
+export const buildSearchRegexFromPieces = (
+  pieces: string[],
+  ccVersion: string,
+  buildTime?: string
+): string => {
+  let pattern = '';
+  // One build object gives an unambiguous source-to-replacement correspondence.
+  // Leave multi-property snapshots literal rather than accepting paths that the
+  // replacement helper cannot safely associate with their original fields.
+  const varyWorkerUrl =
+    pieces.reduce(
+      (count, piece) =>
+        count +
+        [...piece.matchAll(new RegExp(HOOKS_WORKER_URL_PROPERTY, 'g'))].length,
+      0
+    ) === 1;
+
+  for (let i = 0; i < pieces.length; i++) {
+    // Replace <<CCVERSION>> with actual version before escaping
+    let piece = pieces[i].replace(/<<CCVERSION>>/g, ccVersion);
+
+    // Replace <<BUILD_TIME>> with actual build time if provided
+    if (buildTime) {
+      piece = piece.replace(/<<BUILD_TIME>>/g, buildTime);
+    }
+
+    // The doctor prompt embeds a build object whose worker path differs in npm
+    // and native bundles. Split out only that property before escaping literal
+    // text; the final regex adds no captures and cannot swallow adjacent fields.
+    const escapedPiece = piece
+      .split(new RegExp(`(${HOOKS_WORKER_URL_PROPERTY})`, 'g'))
+      .map((fragment, index) =>
+        index % 2 === 1 && varyWorkerUrl
+          ? HOOKS_WORKER_URL_PROPERTY
+          : fragment.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      )
+      .join('');
+
+    // Handle non-ASCII characters by creating alternation patterns
+    const withNonAsciiHandling = escapeNonAsciiForRegex(escapedPiece);
+
+    // Handle newlines: match both actual newlines (template literals) and literal \n (string literals)
+    // In regex pattern: \n matches newline, \\n matches literal backslash-n
+    const withNewlineHandling = withNonAsciiHandling.replace(
+      /\n/g,
+      '(?:\n|\\\\n)'
+    );
+    pattern += withNewlineHandling;
+
+    // Add capture group for the variable if this isn't the last piece
+    if (i < pieces.length - 1) {
+      // Match only the identifier itself - pieces contain ${, }, and any method calls
+      // This is more robust as it doesn't assume where } appears
+      pattern += '([\\w$]+)';
+    }
+  }
+
+  return pattern;
+};
+
+const countPrecedingBackslashes = (content: string, pos: number): number => {
+  let count = 0;
+  let j = pos - 1;
+  while (j >= 0 && content[j] === '\\') {
+    count++;
+    j--;
+  }
+  return count;
+};
+
+/**
+ * What a character of a prompt body is, read the way the template literal
+ * holding it reads it: template text, or JavaScript inside a `${...}`
+ * interpolation (code, or a quoted string literal within it). Text of a
+ * template literal nested inside an interpolation is kept apart from top-level
+ * text because only top-level backticks get escaped.
+ */
+const enum BodyChar {
+  Code,
+  String,
+  Text,
+  NestedText,
+}
+
+/**
+ * Classifies every character of a prompt body as template text or
+ * interpolation code. Nested string and template literals inside an
+ * interpolation are tracked so a quote or brace within one cannot end the
+ * interpolation early.
+ *
+ * This is the one walker behind both escapeDepthZeroBackticks (apply) and
+ * decodeQuoteEscapes (markdown generation). #922 records three attempts at a
+ * second, hand-mirrored copy for the decode side; every one desynchronised
+ * from this state machine and made the escape pass drop the prompt as
+ * incomplete. Sharing it keeps the two directions consistent.
+ */
+const scanTemplateBody = (
+  content: string
+): { kinds: BodyChar[]; incomplete: boolean } => {
+  const kinds: BodyChar[] = new Array(content.length);
+  let depth = 0;
+  let inString = '';
+  const templateStack: number[] = [];
+
+  for (let i = 0; i < content.length; i++) {
+    const ch = content[i];
+    const next = content[i + 1];
+    const unescaped = countPrecedingBackslashes(content, i) % 2 === 0;
+
+    if (depth) {
+      const inTemplate =
+        templateStack.length > 0 &&
+        depth === templateStack[templateStack.length - 1];
+      kinds[i] = inTemplate ? BodyChar.NestedText : BodyChar.Code;
+      if (inTemplate) {
+        if (ch === '`' && unescaped) {
+          templateStack.pop();
+        } else if (ch === '$' && next === '{') {
+          if (unescaped) depth++;
+          kinds[++i] = BodyChar.NestedText;
+        }
+        continue;
+      }
+      if (inString) kinds[i] = BodyChar.String;
+      if (!inString) {
+        if (ch === '$' && next === '{') {
+          if (unescaped) depth++;
+          kinds[++i] = BodyChar.Code;
+        } else if (ch === '"' || ch === "'") {
+          inString = ch;
+          kinds[i] = BodyChar.String;
+        } else if (ch === '`' && unescaped) {
+          templateStack.push(depth);
+        } else if (ch === '{') {
+          depth++;
+        } else if (ch === '}') {
+          depth--;
+        }
+      } else if (ch === inString && unescaped) {
+        inString = '';
+      }
+      continue;
+    }
+
+    kinds[i] = BodyChar.Text;
+    if (ch === '$' && next === '{') {
+      if (unescaped) depth++;
+      kinds[++i] = BodyChar.Text;
+    }
+  }
+
+  return { kinds, incomplete: depth > 0 || templateStack.length > 0 };
+};
+
+/**
+ * Escapes unescaped backticks at depth 0 (outside ${...} interpolations).
+ */
+export const escapeDepthZeroBackticks = (
+  content: string
+): { content: string; incomplete: boolean } => {
+  const { kinds, incomplete } = scanTemplateBody(content);
+  let out = '';
+  for (let i = 0; i < content.length; i++) {
+    const ch = content[i];
+    out +=
+      ch === '`' &&
+      kinds[i] === BodyChar.Text &&
+      countPrecedingBackslashes(content, i) % 2 === 0
+        ? '\\`'
+        : ch;
+  }
+
+  if (incomplete) {
+    debug(
+      'escapeDepthZeroBackticks: unclosed interpolation detected. Some backticks may not have been escaped.'
+    );
+  }
+
+  return { content: out, incomplete };
+};
+
+const JS_KEYWORDS = new Set(
+  'await break case catch class const continue debugger default delete do else export extends false finally for function if import in instanceof let new null of return static super switch this throw true try typeof undefined var void while with yield async'.split(
+    ' '
+  )
+);
+
+/**
+ * Names a prompt body's live `${...}` interpolations read: identifiers in code
+ * position, not property names after a dot, not text inside string or
+ * template literals, not keywords, and not the parameters of an arrow function
+ * written inside the interpolation.
+ */
+const prevNonSpace = (s: string, i: number): string => {
+  while (--i >= 0 && /\s/.test(s[i]));
+  return i >= 0 ? s[i] : '';
+};
+
+const nextNonSpace = (s: string, i: number): string => {
+  while (i < s.length && /\s/.test(s[i])) i++;
+  return i < s.length ? s[i] : '';
+};
+
+export const interpolationReferences = (content: string): Set<string> => {
+  const { kinds } = scanTemplateBody(content);
+  let code = '';
+  for (let i = 0; i < content.length; i++)
+    code += kinds[i] === BodyChar.Code ? content[i] : ' ';
+
+  // Arrow parameters, including destructured ones like ({a, b: c}) => …;
+  // pattern keys (b:), default values (= x) and member names (.x) are not
+  // bindings.
+  const params = new Set<string>();
+  for (const m of code.matchAll(/\(([^()]*)\)\s*=>|([A-Za-z_$][\w$]*)\s*=>/g)) {
+    const list = m[1] ?? m[2];
+    for (const id of list.matchAll(/[A-Za-z_$][\w$]*/g)) {
+      const before = prevNonSpace(list, id.index);
+      if (before === '=' || before === '.') continue;
+      if (nextNonSpace(list, id.index + id[0].length) === ':') continue;
+      params.add(id[0]);
+    }
+  }
+
+  const refs = new Set<string>();
+  for (const m of code.matchAll(/(?<![\w$.])[A-Za-z_$][\w$]*(?!\{)/g)) {
+    const name = m[0];
+    if (JS_KEYWORDS.has(name) || params.has(name)) continue;
+    // Object-literal keys ({key: v}) are not references; a ternary operand
+    // (a ? b : c) is, and is preceded by `?` rather than `{` or `,`.
+    const before = prevNonSpace(code, m.index);
+    if (
+      (before === '{' || before === ',') &&
+      nextNonSpace(code, m.index + name.length) === ':'
+    )
+      continue;
+    refs.add(name);
+  }
+  return refs;
+};
+
+/**
+ * Extracts leading and trailing whitespace from the original prompt pieces.
+ * Returns the whitespace prefix from the first piece and suffix from the last piece.
+ */
+export const extractOriginalWhitespace = (
+  pieces: string[]
+): { leading: string; trailing: string } => {
+  if (pieces.length === 0) {
+    return { leading: '', trailing: '' };
+  }
+
+  // Extract leading whitespace from the first piece
+  const firstPiece = pieces[0];
+  const leadingMatch = firstPiece.match(/^(\s*)/);
+  const leading = leadingMatch ? leadingMatch[1] : '';
+
+  // Extract trailing whitespace from the last piece
+  const lastPiece = pieces[pieces.length - 1];
+  const trailingMatch = lastPiece.match(/(\s*)$/);
+  const trailing = trailingMatch ? trailingMatch[1] : '';
+
+  return { leading, trailing };
+};
+
+/**
+ * Applies the original prompt's whitespace structure to user content.
+ * If the user content is empty/whitespace-only, returns empty string.
+ * Otherwise, trims the user content and wraps it with the original's whitespace.
+ */
+export const applyOriginalWhitespace = (
+  userContent: string,
+  originalWhitespace: { leading: string; trailing: string }
+): string => {
+  // If user content is empty or whitespace-only, they want it empty
+  if (userContent.trim() === '') {
+    return '';
+  }
+
+  // Trim user content and apply original whitespace
+  const trimmed = userContent.trim();
+  return originalWhitespace.leading + trimmed + originalWhitespace.trailing;
+};
+
+/**
+ * Applies identifier mapping to convert human-readable names to actual minified variables.
+ * Takes content with ${HUMAN_NAME} and converts to ${actualVar} using extracted variable names.
+ *
+ * The identifiers array tells us the order and label indices of captured variables.
+ * For example:
+ *   identifiers: [2, 0, 1] means:
+ *     - extractedVars[0] maps to identifierMap["2"]
+ *     - extractedVars[1] maps to identifierMap["0"]
+ *     - extractedVars[2] maps to identifierMap["1"]
+ */
+export const applyIdentifierMapping = (
+  content: string,
+  identifiers: (number | string)[],
+  identifierMap: Record<string, string>,
+  extractedVars: string[],
+  ccVersion: string,
+  buildTime?: string,
+  pieces?: string[]
+): string => {
+  // Build reverse map: HUMAN_NAME -> actual minified var from cli.js
+  const reverseMap: Record<string, string> = {};
+
+  // Use identifiers array to map in correct order
+  for (let i = 0; i < extractedVars.length; i++) {
+    const capturedVar = extractedVars[i];
+    const labelIndex = String(identifiers[i]);
+    const humanName = identifierMap[labelIndex];
+
+    if (humanName) {
+      // Skip empty mappings
+      reverseMap[humanName] = capturedVar;
+    }
+  }
+
+  // Replace ${HUMAN_NAME} with ${actualVar} - sort by length descending to avoid partial replacements
+  const sortedEntries = Object.entries(reverseMap).sort(
+    (a, b) => b[0].length - a[0].length
+  );
+
+  // Only substitute inside a live `${...}` interpolation. A prompt's prose can
+  // legitimately contain one of its own placeholder names: the background-session
+  // prompt documents the environment variable `$CLAUDE_JOB_DIR/tmp` while
+  // CLAUDE_JOB_DIR is also its placeholder for a minified variable, and a
+  // whole-body replace shipped that sentence to Claude Code as `$e/tmp` (#930).
+  // The same name still has to be substituted where it IS an identifier, so this
+  // is scoped by position rather than skipped by name.
+  // Compile once rather than per span: a prompt can carry hundreds of
+  // interpolations, and rebuilding every pattern inside the loop is measurably
+  // slower for no benefit.
+  const patterns = sortedEntries.map(
+    ([humanName, actualVar]) =>
+      [new RegExp(`\\b${humanName}\\b`, 'g'), actualVar] as const
+  );
+
+  // Scoping relies on every identifier slot landing inside an interpolation.
+  // That holds because the pieces themselves carry the `${` and `}` around each
+  // slot, not because anything here enforces it: across every snapshot in
+  // data/prompts, all 105218 insertion points in the 24863 prompts that carry
+  // identifiers fall inside a span. A prompt assembled by concatenation instead
+  // (`"before" + x + "after"`) would put the name outside every span and its
+  // mapping would be skipped, so re-check that if the extractor's output shape
+  // ever changes.
+  let result = '';
+  let cursor = 0;
+
+  for (const { start, end } of interpolationSpans(content)) {
+    let region = content.slice(start, end);
+
+    for (const [pattern, actualVar] of patterns) {
+      // Use a replacer function to avoid special replacement pattern interpretation (e.g., $$ -> $), see #237
+      region = region.replace(pattern, () => actualVar);
+    }
+
+    result += content.slice(cursor, start) + region;
+    cursor = end;
+  }
+
+  result += content.slice(cursor);
+
+  // Replace <<CCVERSION>> with the actual Claude Code version
+  result = result.replace(/<<CCVERSION>>/g, ccVersion);
+
+  // Replace <<BUILD_TIME>> with the actual build timestamp if provided
+  if (buildTime) {
+    result = result.replace(/<<BUILD_TIME>>/g, buildTime);
+  }
+
+  // Non-ASCII encoding deliberately does NOT happen here. It emits JS syntax
+  // and must run after the string-literal escaping in applySystemPrompts, or
+  // the backslash-doubling pass corrupts the escapes it produces (#920).
+
+  // Apply original whitespace structure from pieces if provided
+  if (pieces && pieces.length > 0) {
+    const originalWhitespace = extractOriginalWhitespace(pieces);
+    result = applyOriginalWhitespace(result, originalWhitespace);
+  }
+
+  return result;
+};
+
+/**
+ * Reads system prompts from dynamically downloaded strings-X.Y.Z.json to generate search regex,
+ * and from ~/.tweakcc/system-prompts for replacement content.
+ *
+ * The workflow:
+ * 1. Download strings-X.Y.Z.json (has pieces, identifiers, identifierMap)
+ * 2. Build search regex from pieces array
+ * 3. Match against cli.js to extract ACTUAL variable names
+ * 4. Read corresponding .md file (has ${HUMAN_NAME} placeholders)
+ * 5. Replace ${HUMAN_NAME} with actual vars from cli.js
+ *
+ * Returns empty array if strings file is not available (not preloaded or failed to download)
+ */
+export const loadSystemPromptsWithRegex = async (
+  ccVersion: string,
+  buildTime?: string
+): Promise<
+  Array<{
+    promptId: string;
+    prompt: MarkdownPrompt;
+    regex: string;
+    getInterpolatedContent: (match: RegExpMatchArray) => string;
+    pieces: string[];
+    identifiers: (number | string)[];
+    identifierMap: Record<string, string>;
+  }>
+> => {
+  // Check if strings file was preloaded - if not, return empty array
+  if (!globalStringsFile || globalCachedVersion !== ccVersion) {
+    return [];
+  }
+
+  const stringsJson: StringsFile = globalStringsFile;
+
+  const results: Array<{
+    promptId: string;
+    prompt: MarkdownPrompt;
+    regex: string;
+    getInterpolatedContent: (match: RegExpMatchArray) => string;
+    pieces: string[];
+    identifiers: (number | string)[];
+    identifierMap: Record<string, string>;
+  }> = [];
+
+  // For each prompt in strings.json
+  for (const jsonPrompt of stringsJson.prompts) {
+    // Build the search regex from pieces array
+    const regex = buildSearchRegexFromPieces(
+      jsonPrompt.pieces,
+      ccVersion,
+      buildTime
+    );
+
+    // Try to read the corresponding markdown file for REPLACEMENT content
+    const mdPath = path.join(SYSTEM_PROMPTS_DIR, `${jsonPrompt.id}.md`);
+    let markdown;
+    try {
+      markdown = await fs.readFile(mdPath, 'utf8');
+    } catch (error) {
+      console.error(`Failed to read markdown file ${mdPath}:`, error);
+      continue;
+    }
+    const replacementPrompt = parseMarkdownPrompt(markdown);
+
+    // Create a function that will apply identifier mapping when we have the match
+    const getInterpolatedContent = (match: RegExpMatchArray): string => {
+      // Extract captured variable names from the regex match (skip index 0 which is full match)
+      const extractedVars = match.slice(1);
+
+      // The markdown file has content with human-readable variable names
+      // We need to replace those with the actual minified variable names from cli.js
+      // Matching a build-specific URL is not permission to replace it with the
+      // snapshot's npm path. Carry the exact matched property into customized
+      // Markdown before mapping identifiers; unchanged prompts still round-trip
+      // verbatim in applySystemPrompts.
+      const content = preserveMatchedWorkerUrl(
+        replacementPrompt.content,
+        jsonPrompt.pieces,
+        match[0]
+      );
+      return applyIdentifierMapping(
+        content,
+        jsonPrompt.identifiers,
+        jsonPrompt.identifierMap,
+        extractedVars,
+        ccVersion,
+        buildTime,
+        jsonPrompt.pieces
+      );
+    };
+
+    results.push({
+      promptId: jsonPrompt.id,
+      prompt: replacementPrompt,
+      regex,
+      getInterpolatedContent,
+      pieces: jsonPrompt.pieces,
+      identifiers: jsonPrompt.identifiers,
+      identifierMap: jsonPrompt.identifierMap,
+    });
+  }
+
+  return results;
+};
+
+/**
+ * Formats and displays sync results to the user
+ */
+export const displaySyncResults = (summary: SyncSummary): void => {
+  const created = summary.results.filter(r => r.action === 'created');
+  const updated = summary.results.filter(r => r.action === 'updated');
+  const conflicts = summary.results.filter(r => r.action === 'conflict');
+  const skipped = summary.results.filter(r => r.action === 'skipped');
+
+  // Display skipped files (if any)
+  if (
+    (created.length > 0 || updated.length > 0 || conflicts.length > 0) &&
+    skipped.length > 0
+  ) {
+    console.log(chalk.dim(`Skipped ${skipped.length} up-to-date file(s)`));
+    console.log();
+  }
+
+  // Display created files
+  if (created.length > 0) {
+    console.log(
+      chalk.bold.green(`Created ${created.length} new prompt file(s):`)
+    );
+    for (const result of created) {
+      console.log(chalk.green(`  ${SYSTEM_PROMPTS_DIR}/${result.id}.md`));
+      console.log(chalk.green.dim(`    ${result.description}`));
+    }
+    console.log();
+  }
+
+  // Display updated files
+  if (updated.length > 0) {
+    console.log(
+      chalk.bold.blue(`Updated ${updated.length} system prompt file(s):`)
+    );
+    for (const result of updated) {
+      if (result.oldVersion) {
+        console.log(
+          chalk.blue(
+            `  ${result.id}.md  (${result.oldVersion} → ${result.newVersion})`
+          )
+        );
+      } else {
+        console.log(chalk.blue(`  ${result.id}.md  (→ ${result.newVersion})`));
+      }
+    }
+    console.log();
+  }
+
+  // Display conflicts with warnings
+  if (conflicts.length > 0) {
+    console.log(
+      chalk.bold.yellow(
+        `WARNING: Conflicts detected for ${conflicts.length} system prompt file(s)`
+      )
+    );
+    for (const result of conflicts) {
+      console.log(
+        chalk.yellow(
+          ` ${result.id}.md (${result.oldVersion} → ${result.newVersion})`
+        )
+      );
+      console.log(
+        chalk.yellow(`   Open the diff in your browser: ${result.diffHtmlPath}`)
+      );
+    }
+    console.log();
+  }
+
+  // Actionable next steps
+  if (created.length > 0) {
+    console.log(
+      chalk.green.bold(
+        `New prompt files have been created; either more are now supported by tweakcc or Anthropic has added new ones.`
+      )
+    );
+    console.log(
+      chalk.green(
+        `You can now customize the markdown files at ${SYSTEM_PROMPTS_DIR} in a text editor.`
+      )
+    );
+    console.log(
+      chalk.green(
+        `Then run tweakcc and select "apply" or use tweakcc --apply to update your system prompts`
+      )
+    );
+    console.log();
+  }
+
+  if (conflicts.length > 0) {
+    console.log();
+    console.log(`Review conflicts:`);
+    console.log(`  1. Open the diff HTML files in your browser`);
+    console.log(`  2. Verify your customizations are still appropriate`);
+    console.log(`  3. Update your markdown files if needed`);
+    console.log(
+      chalk.bold.cyan(
+        `  4. Important: Update the ccVersion in your markdown files to the latest version of each prompt:`
+      )
+    );
+    for (const result of conflicts) {
+      console.log(
+        chalk.yellow(`      ${result.id}.md → `) +
+          chalk.bold.magenta(result.newVersion)
+      );
+    }
+    console.log(`  5. Delete the diff HTML files`);
+    console.log();
+  }
+};

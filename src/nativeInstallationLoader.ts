@@ -1,0 +1,157 @@
+/**
+ * Helper module for dynamically loading nativeInstallation.ts.
+ *
+ * nativeInstallation.ts depends on node-lief, which may not be available on all systems
+ * (e.g., NixOS or systems without proper C++ libraries). This module provides a safe way
+ * to dynamically import nativeInstallation.ts only when node-lief is available.
+ */
+
+import type {
+  extractClaudeJsFromNativeInstallation as ExtractFn,
+  extractClaudeJsModulesFromNativeInstallation as ExtractCorpusFn,
+  extractNativeInstallationModules as ExtractModulesFn,
+  repackNativeInstallation as RepackFn,
+  repackNativeInstallationModules as RepackModulesFn,
+  repackNativeInstallationModuleGraph as RepackGraphFn,
+  resolveNixBinaryWrapper as ResolveNixFn,
+} from './nativeInstallation';
+
+import { debug } from './utils';
+
+interface NativeInstallationModule {
+  extractClaudeJsFromNativeInstallation: typeof ExtractFn;
+  extractClaudeJsModulesFromNativeInstallation: typeof ExtractCorpusFn;
+  extractNativeInstallationModules: typeof ExtractModulesFn;
+  repackNativeInstallation: typeof RepackFn;
+  repackNativeInstallationModules: typeof RepackModulesFn;
+  repackNativeInstallationModuleGraph: typeof RepackGraphFn;
+  resolveNixBinaryWrapper: typeof ResolveNixFn;
+}
+
+let cachedModule: NativeInstallationModule | null = null;
+
+/**
+ * Attempts to load the nativeInstallation module.
+ * Returns null if node-lief is not available.
+ */
+async function tryLoadNativeInstallationModule(): Promise<NativeInstallationModule | null> {
+  if (cachedModule !== null) {
+    return cachedModule;
+  }
+
+  try {
+    // First check if node-lief is available
+    await import('node-lief');
+    // If it is, dynamically import the module that uses it
+    cachedModule = await import('./nativeInstallation');
+    return cachedModule;
+  } catch (err) {
+    debug(
+      `Error loading native installation module: ${err instanceof Error ? err.message : String(err)}`
+    );
+    if (err instanceof Error) {
+      debug(err);
+    }
+    // node-lief not available
+    return null;
+  }
+}
+
+/**
+ * Extracts claude.js from a native installation binary.
+ * Returns null if node-lief is not available or extraction fails.
+ */
+export async function extractClaudeJsFromNativeInstallation(
+  nativeInstallationPath: string
+): Promise<Buffer | null> {
+  const mod = await tryLoadNativeInstallationModule();
+  if (!mod) {
+    return null;
+  }
+  return mod.extractClaudeJsFromNativeInstallation(nativeInstallationPath);
+}
+
+export async function extractNativeInstallationModules(
+  nativeInstallationPath: string
+): Promise<ReturnType<typeof ExtractModulesFn>> {
+  const mod = await tryLoadNativeInstallationModule();
+  return mod?.extractNativeInstallationModules(nativeInstallationPath) ?? null;
+}
+
+/** Writes changed module sources back into a code-split native graph. */
+export async function repackNativeInstallationModuleGraph(
+  binPath: string,
+  replacements: ReadonlyMap<string, Buffer>,
+  outputPath: string
+): Promise<void> {
+  const mod = await tryLoadNativeInstallationModule();
+  if (!mod) {
+    throw new Error(
+      '`repackNativeInstallationModuleGraph()` called but `node-lief` is not available.'
+    );
+  }
+  mod.repackNativeInstallationModuleGraph(binPath, replacements, outputPath);
+}
+
+/**
+ * Reads the complete embedded corpus. The path must resolve any Nix wrapper.
+ * Returns null when native support is unavailable or the graph cannot be read.
+ */
+export async function extractClaudeJsModulesFromNativeInstallation(
+  nativeInstallationPath: string
+): Promise<ReturnType<typeof ExtractCorpusFn>> {
+  const mod = await tryLoadNativeInstallationModule();
+  if (!mod) return null;
+  return mod.extractClaudeJsModulesFromNativeInstallation(
+    nativeInstallationPath
+  );
+}
+
+/**
+ * Writes identity-validated source replacements without loading native support
+ * until needed. Throws if support is unavailable or validation/writing fails.
+ * Callers must use the digest from the original corpus and resolved binary path.
+ */
+export async function repackNativeInstallationModules(
+  ...args: Parameters<typeof RepackModulesFn>
+): Promise<void> {
+  const mod = await tryLoadNativeInstallationModule();
+  if (!mod) throw new Error('Native module repacking requires node-lief');
+  mod.repackNativeInstallationModules(...args);
+}
+
+/**
+ * Repacks a modified claude.js back into the native installation binary.
+ * This should only be called after a successful extractClaudeJsFromNativeInstallation(),
+ * which ensures the module is already loaded and cached.
+ */
+export async function repackNativeInstallation(
+  binPath: string,
+  modifiedClaudeJs: Buffer,
+  outputPath: string
+): Promise<void> {
+  // The module should already be cached from a prior extractClaudeJsFromNativeInstallation() call
+  const mod = await tryLoadNativeInstallationModule();
+  if (!mod) {
+    throw new Error(
+      '`repackNativeInstallation()` called but `node-lief` is not available. ' +
+        'This is unexpected - `extractClaudeJsFromNativeInstallation()` should have been called first.'
+    );
+  }
+  mod.repackNativeInstallation(binPath, modifiedClaudeJs, outputPath);
+}
+
+/**
+ * Detects whether a binary is a Nix `makeBinaryWrapper` wrapper and returns
+ * the path to the real wrapped executable, or null if not a wrapper.
+ * Returns null if node-lief is not available.
+ */
+export async function resolveNixBinaryWrapper(
+  binaryPath: string
+): Promise<string | null> {
+  const mod = await tryLoadNativeInstallationModule();
+  if (!mod) {
+    return null;
+  }
+  return mod.resolveNixBinaryWrapper(binaryPath);
+}

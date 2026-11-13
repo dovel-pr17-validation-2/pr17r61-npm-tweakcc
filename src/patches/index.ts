@@ -1,0 +1,1396 @@
+import * as fs from 'node:fs/promises';
+import * as fsSync from 'node:fs';
+import * as path from 'node:path';
+
+import {
+  APPLIED_RECORD_FILE,
+  CONFIG_DIR,
+  NATIVE_BINARY_BACKUP_FILE,
+  updateConfigFile,
+} from '../config';
+import { recordAppliedBinary } from '../appliedRecord';
+import { ClaudeCodeInstallationInfo, TweakccConfig } from '../types';
+import type { NativeBunGraph } from '../nativeInstallation';
+import { debug, replaceFileBreakingHardLinks } from '../utils';
+import {
+  extractClaudeJsFromNativeInstallation,
+  extractNativeInstallationModules,
+  repackNativeInstallation,
+  repackNativeInstallationModuleGraph,
+} from '../nativeInstallationLoader';
+import { DEFAULT_SETTINGS } from '../defaultSettings';
+import {
+  assertPatchedBundleParses,
+  PatchedBundleParseError,
+} from './parseGate';
+
+// Notes to patch-writers:
+//
+// - Always use [$\w]+ instead of \w+ to match identifiers (variable/function names), because at
+//   least in Node.js's regex engine, \w+ does not include $, so ABC$, which is a perfectly valid
+//   identifier, would not be matched.  The way cli.js is minified, $ frequently appears in global
+//   identifiers.
+//
+// - When starting a regular expression with an identifier name, for example if you're matching a
+//   string of the form "someVarName = ...", make sure to put some kind of word boundary at the
+//   beginning, e.g. `,` `;` `}` or `{`.  This can **SIGNIFICANTLY** speed up matching, easily
+//   bringing a 1.5s search down to 30ms.  **DO NOT** use `\b`, because it doesn't properly treat
+//   `$`, which appears in identifiers often, as a word character, so `\b[$\w]+` will NOT match `,$=`.
+//
+
+import { writeShowMoreItemsInSelectMenus } from './showMoreItemsInSelectMenus';
+import { writeThemes } from './themes';
+import { writeContextLimit } from './contextLimit';
+import { writeInputBoxBorder } from './inputBorderBox';
+import { writeInputChevronColor } from './inputChevronColor';
+import { writeInputCursorColor } from './inputCursorColor';
+import { writeThinkerFormat } from './thinkerFormat';
+import { writeThinkerSymbolMirrorOption } from './thinkerMirrorOption';
+import { writeThinkerSymbolChars } from './thinkerSymbolChars';
+import { writeThinkerSymbolSpeed } from './thinkerSymbolSpeed';
+import {
+  thinkerSymbolBoxWidth,
+  writeThinkerSymbolWidthLocation,
+} from './thinkerSymbolWidth';
+import { writeThinkingVerbs } from './thinkingVerbs';
+import {
+  isUserMessageDisplayCustomized,
+  writeUserMessageDisplay,
+} from './userMessageDisplay';
+import { writeInputPatternHighlighters } from './inputPatternHighlighters';
+import { writeVerboseProperty } from './verboseProperty';
+import { writeModelCustomizations } from './modelSelector';
+import { writeOpusplan1m } from './opusplan1m';
+import { writeThinkingVisibility } from './thinkingVisibility';
+import { writeSubagentModels } from './subagentModels';
+import { writePatchesAppliedIndication } from './patchesAppliedIndication';
+import { applySystemPrompts } from './systemPrompts';
+import { writeFixLspSupport } from './fixLspSupport';
+import { writeToolsets } from './toolsets';
+import { writeTableFormat } from './tableFormat';
+import { writeConversationTitle } from './conversationTitle';
+import { writeHideStartupBanner } from './hideStartupBanner';
+import { writeHideCtrlGToEdit } from './hideCtrlGToEdit';
+import { writeHideStartupClawd } from './hideStartupClawd';
+import { writeIncreaseFileReadLimit } from './increaseFileReadLimit';
+import { writeSuppressLineNumbers } from './suppressLineNumbers';
+import { writeSuppressRateLimitOptions } from './suppressRateLimitOptions';
+import { writeSuppressRateLimitWarning } from './suppressRateLimitWarning';
+import { writeSessionMemory } from './sessionMemory';
+import { writeRememberSkill } from './rememberSkill';
+import { writeThinkingBlockStyling } from './thinkingBlockStyling';
+import { writeMcpNonBlocking, writeMcpBatchSize } from './mcpStartup';
+import { writeStatuslineUpdateThrottle } from './statuslineUpdateThrottle';
+import { writeTokenCountRounding } from './tokenCountRounding';
+import { writeAgentsMd } from './agentsMd';
+import { writeAutoAcceptPlanMode } from './autoAcceptPlanMode';
+import { writeAllowBypassPermsInSudo } from './allowBypassPermsInSudo';
+import { writeSuppressNativeInstallerWarning } from './suppressNativeInstallerWarning';
+import { writeScrollEscapeSequenceFilter } from './scrollEscapeSequenceFilter';
+import { writeTmuxGraphicsPassthrough } from './tmuxGraphicsPassthrough';
+import { writeWorktreeMode } from './worktreeMode';
+import { writeAllowCustomAgentModels } from './allowCustomAgentModels';
+import { writeVoiceMode } from './voiceMode';
+import { writeChannelsMode } from './channelsMode';
+import { writeSkipDevChannelsDialog } from './skipDevChannelsDialog';
+import { writeSkipTrustDialog } from './skipTrustDialog';
+import { writeDisableCtrlZSuspend } from './disableCtrlZSuspend';
+import { writeWebFetchUserAgent } from './webFetchUserAgent';
+import { writeSkipSkillShellValidation } from './skipSkillShellValidation';
+import { isShimmerCustomized, writeShimmerStyle } from './shimmerStyle';
+import {
+  applyPatchImplementationsToGraph,
+  changedModuleSources,
+  javaScriptModuleSources,
+  textModuleSources,
+} from './nativeGraphDispatcher';
+import { assertPatchedModuleParses } from './moduleParseGate';
+import { writeClearScreen } from './clearScreen';
+import { writeSessionColor } from './sessionColor';
+import { writeKeybindingCustomization } from './keybindingCustomization';
+import { writePlanExitCommand } from './planExitCommand';
+import {
+  restoreNativeBinaryFromBackup,
+  restoreClijsFromBackup,
+} from '../installationBackup';
+import { compareVersions } from '../systemPromptSync';
+import {
+  writePreventUnsupportedUpdates,
+  writePreventUnsupportedUpdatesModules,
+} from './preventUnsupportedUpdates';
+import { writeKeepPatchedBinary } from './keepPatchedBinary';
+
+export { showDiff, showPositionalDiff, globalReplace } from './patchDiffing';
+export {
+  escapeNonAscii,
+  findChalkVar,
+  getModuleLoaderFunction,
+  getReactModuleNameNonBun,
+  getReactModuleFunctionBun,
+  getReactVar,
+  clearReactVarCache,
+  findRequireFunc,
+  getRequireFuncName,
+  clearRequireFuncNameCache,
+  findTextComponent,
+  findBoxComponent,
+} from './helpers';
+
+export interface LocationResult {
+  startIndex: number;
+  endIndex: number;
+  identifiers?: string[];
+}
+
+export interface ModificationEdit {
+  startIndex: number;
+  endIndex: number;
+  newContent: string;
+}
+
+// =============================================================================
+// Patch Group and Result Types
+// =============================================================================
+
+export enum PatchGroup {
+  SYSTEM_PROMPTS = 'System Prompts',
+  ALWAYS_APPLIED = 'Always Applied',
+  MISC_CONFIGURABLE = 'Misc Configurable',
+  FEATURES = 'Features',
+}
+
+export interface PatchResult {
+  id: string;
+  name: string;
+  group: PatchGroup;
+  applied: boolean;
+  failed?: boolean;
+  skipped?: boolean;
+  details?: string;
+  description?: string;
+}
+
+export interface ApplyCustomizationResult {
+  config: TweakccConfig;
+  results: PatchResult[];
+}
+
+// =============================================================================
+// Patch Definitions (Single Source of Truth)
+// =============================================================================
+
+/**
+ * All patch definitions with their metadata.
+ * This is the single source of truth for patch IDs, names, groups, and descriptions.
+ */
+const PATCH_DEFINITIONS = [
+  // Always Applied
+  {
+    id: 'verbose-property',
+    name: 'Verbose property',
+    group: PatchGroup.ALWAYS_APPLIED,
+    description: 'Token counter will show (2s · ↓ 169 tokens · thinking)',
+  },
+  {
+    id: 'opusplan1m',
+    name: 'Opusplan[1m] support',
+    group: PatchGroup.ALWAYS_APPLIED,
+    description:
+      'Use the "Opus Plan 1M" model: Opus for planning, Sonnet 1M context for building',
+  },
+  {
+    id: 'thinking-block-styling',
+    name: 'Thinking block styling',
+    group: PatchGroup.ALWAYS_APPLIED,
+    description: 'Restore dim/gray + italic styling for thinking blocks',
+  },
+  {
+    id: 'fix-lsp-support',
+    name: 'Fix LSP support',
+    group: PatchGroup.ALWAYS_APPLIED,
+    description: 'Enable/fix nascent LSP support',
+  },
+  {
+    id: 'statusline-update-throttle',
+    name: `Statusline update throttling correction`,
+    group: PatchGroup.ALWAYS_APPLIED,
+    description: `Statusline updates will be properly throttled instead of queued (or debounced)`,
+  },
+  {
+    id: 'clear-screen',
+    name: 'Clear screen command',
+    group: PatchGroup.ALWAYS_APPLIED,
+    description: 'Register /clear-screen command (clear scrollback + redraw)',
+  },
+  {
+    id: 'session-color',
+    name: 'Session color from env',
+    group: PatchGroup.ALWAYS_APPLIED,
+    description:
+      'Set session prompt bar color via TWEAKCC_SESSION_COLOR env var',
+  },
+  {
+    id: 'keybinding-customization',
+    name: 'Keybinding customization',
+    group: PatchGroup.ALWAYS_APPLIED,
+    description:
+      'Force-enable custom keybindings when CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1',
+  },
+  {
+    id: 'plan-exit-command',
+    name: '/plan exit command',
+    group: PatchGroup.ALWAYS_APPLIED,
+    description:
+      'Add /plan exit to open the plan approval dialog without a model turn',
+  },
+  // Misc Configurable
+  {
+    id: 'model-customizations',
+    name: 'Model customizations',
+    group: PatchGroup.MISC_CONFIGURABLE,
+    description: 'Access all Claude models with /model, not just latest 3',
+  },
+  {
+    id: 'show-more-items-in-select-menus',
+    name: 'Show more items in select menus',
+    group: PatchGroup.MISC_CONFIGURABLE,
+    description: 'Show 25 items in select menus instead of default 5',
+  },
+  {
+    id: 'context-limit',
+    name: 'Context limit',
+    group: PatchGroup.MISC_CONFIGURABLE,
+    description:
+      'Override the 200K context limit via CLAUDE_CODE_CONTEXT_LIMIT env var (set before launching CC)',
+  },
+  {
+    id: 'patches-applied-indication',
+    name: 'Patches applied indication',
+    group: PatchGroup.MISC_CONFIGURABLE,
+    description: 'Show "tweakcc patches applied" and tweakcc version inside CC',
+  },
+  {
+    id: 'table-format',
+    name: 'Table format',
+    group: PatchGroup.MISC_CONFIGURABLE,
+    description: 'Tables generated by Claude will be rendered more compactly',
+  },
+  {
+    id: 'themes',
+    name: 'Themes',
+    group: PatchGroup.MISC_CONFIGURABLE,
+    description: 'Your custom themes will be available via /theme',
+  },
+  {
+    id: 'thinking-verbs',
+    name: 'Thinking verbs',
+    group: PatchGroup.MISC_CONFIGURABLE,
+    description: 'Your custom list of thinking verbs will be cycled through',
+  },
+  {
+    id: 'thinker-format',
+    name: 'Thinker format',
+    group: PatchGroup.MISC_CONFIGURABLE,
+    description:
+      'Your custom format string that thinking verbs are wrapped in will be applied',
+  },
+  {
+    id: 'thinker-symbol-chars',
+    name: 'Thinker symbol chars',
+    group: PatchGroup.MISC_CONFIGURABLE,
+    description: 'Your custom thinking spinner will be rendered',
+  },
+  {
+    id: 'thinker-symbol-speed',
+    name: 'Thinker symbol speed',
+    group: PatchGroup.MISC_CONFIGURABLE,
+    description: 'The thinking spinner will play at a custom FPS',
+  },
+  {
+    id: 'thinker-symbol-width',
+    name: 'Thinker symbol width',
+    group: PatchGroup.MISC_CONFIGURABLE,
+    description: 'The thinking spinner will be in a box of custom width',
+  },
+  {
+    id: 'thinker-symbol-mirror',
+    name: 'Thinker symbol mirror',
+    group: PatchGroup.MISC_CONFIGURABLE,
+    description:
+      'The thinking spinner will reverse or restart when it finishes',
+  },
+  {
+    id: 'input-box-border',
+    name: 'Input box border',
+    group: PatchGroup.MISC_CONFIGURABLE,
+    description:
+      "Your custom styles to the main input box's border will be applied",
+  },
+  {
+    id: 'input-chevron-color',
+    name: 'Input chevron color',
+    group: PatchGroup.MISC_CONFIGURABLE,
+    description:
+      'The input chevron changes color based on loading state (e.g. green when idle)',
+  },
+  {
+    id: 'input-cursor-color',
+    name: 'Input cursor color',
+    group: PatchGroup.MISC_CONFIGURABLE,
+    description:
+      'The input cursor uses your color instead of inverse video (not with CLAUDE_CODE_NATIVE_CURSOR=1)',
+  },
+  {
+    id: 'subagent-models',
+    name: 'Subagent models',
+    group: PatchGroup.MISC_CONFIGURABLE,
+    description: 'Use custom models for Plan, Explore, and General subagents',
+  },
+  {
+    id: 'thinking-visibility',
+    name: 'Thinking block visibility',
+    group: PatchGroup.MISC_CONFIGURABLE,
+    description:
+      'Thinking blocks outputted by the model will show without Ctrl+O',
+  },
+  {
+    id: 'hide-startup-banner',
+    name: 'Hide startup banner',
+    group: PatchGroup.MISC_CONFIGURABLE,
+    description:
+      'CC\'s startup banner with "Clawd" and release notes will be hidden',
+  },
+  {
+    id: 'hide-ctrl-g-to-edit',
+    name: 'Hide Ctrl+G to edit',
+    group: PatchGroup.MISC_CONFIGURABLE,
+    description: 'Note about using Ctrl+G to edit prompt will be hidden',
+  },
+  {
+    id: 'hide-startup-clawd',
+    name: 'Hide startup Clawd',
+    group: PatchGroup.MISC_CONFIGURABLE,
+    description:
+      'The "Clawd" icon on startup will be hidden for a cleaner look',
+  },
+  {
+    id: 'increase-file-read-limit',
+    name: 'Increase file read limit',
+    group: PatchGroup.MISC_CONFIGURABLE,
+    description:
+      'Max tokens Claude can read from a file at once will be increased',
+  },
+  {
+    id: 'suppress-line-numbers',
+    name: 'Suppress line numbers',
+    group: PatchGroup.MISC_CONFIGURABLE,
+    description:
+      '"1→" "2→" etc. prefixes for each line of Read output will be omitted',
+  },
+  {
+    id: 'suppress-rate-limit-options',
+    name: 'Suppress rate limit options',
+    group: PatchGroup.MISC_CONFIGURABLE,
+    description:
+      "/rate-limit-options won't be injected when limits are reached",
+  },
+  {
+    id: 'suppress-rate-limit-warning',
+    name: 'Suppress rate limit warning',
+    group: PatchGroup.MISC_CONFIGURABLE,
+    description:
+      'Rate limit warning banners will be suppressed (errors still shown)',
+  },
+  {
+    id: 'token-count-rounding',
+    name: 'Token count rounding',
+    group: PatchGroup.MISC_CONFIGURABLE,
+    description:
+      'Round displayed token counts to the nearest multiple of chosen value',
+  },
+  {
+    id: 'remember-skill',
+    name: 'Remember skill',
+    group: PatchGroup.MISC_CONFIGURABLE,
+    description:
+      'Register the built-in "/remember" skill to review session memories and update CLAUDE.local.md',
+  },
+  {
+    id: 'agents-md',
+    name: 'AGENTS.md (and others)',
+    group: PatchGroup.MISC_CONFIGURABLE,
+    description: 'Support AGENTS.md and others in addition to CLAUDE.md',
+  },
+  {
+    id: 'auto-accept-plan-mode',
+    name: 'Auto-accept plan mode',
+    group: PatchGroup.MISC_CONFIGURABLE,
+    description:
+      'Automatically accept plans without the "Ready to code?" confirmation prompt',
+  },
+  {
+    id: 'auto-accept-plan-env',
+    name: 'Auto-accept plan mode via env',
+    group: PatchGroup.MISC_CONFIGURABLE,
+    description:
+      'Auto-accept plans only when TWEAKCC_AUTO_ACCEPT_PLAN is set (used when "Auto-accept plan mode" is off)',
+  },
+  {
+    id: 'allow-sudo-bypass-permissions',
+    name: 'Allow bypassing permissions with --dangerously-skip-permissions in sudo',
+    group: PatchGroup.MISC_CONFIGURABLE,
+    description:
+      'Allow bypassing permissions with --dangerously-skip-permissions even when running with root/sudo privileges',
+  },
+  {
+    id: 'suppress-native-installer-warning',
+    name: 'Suppress native installer warning',
+    group: PatchGroup.MISC_CONFIGURABLE,
+    description: 'Suppress the native installer warning message at startup',
+  },
+  {
+    id: 'filter-scroll-escape-sequences',
+    name: 'Filter scroll escape sequences',
+    group: PatchGroup.MISC_CONFIGURABLE,
+    description:
+      'Filter out terminal escape sequences that cause unwanted scrolling',
+  },
+  {
+    id: 'tmux-graphics-passthrough',
+    name: 'tmux graphics passthrough',
+    group: PatchGroup.MISC_CONFIGURABLE,
+    description:
+      'Images show inside tmux (needs allow-passthrough on and CLAUDE_CODE_FORCE_TERMINAL_IMAGES=1)',
+  },
+  // Features
+  {
+    id: 'allow-custom-agent-models',
+    name: 'Allow custom agent models',
+    group: PatchGroup.FEATURES,
+    description:
+      'Allow arbitrary model names in custom agent frontmatter (e.g. gemini-2.5-flash)',
+  },
+  {
+    id: 'worktree-mode',
+    name: 'Worktree mode',
+    group: PatchGroup.FEATURES,
+    description:
+      'Enable the EnterWorktree tool for isolated git worktree sessions',
+  },
+  {
+    id: 'session-memory',
+    name: 'Session memory',
+    group: PatchGroup.FEATURES,
+    description:
+      'Enable session memory (auto-extraction + past session search)',
+  },
+  {
+    id: 'toolsets',
+    name: 'Toolsets',
+    group: PatchGroup.FEATURES,
+    description: 'Custom toolsets will be registered',
+  },
+  {
+    id: 'mcp-non-blocking',
+    name: 'MCP non-blocking',
+    group: PatchGroup.FEATURES,
+    description: 'If you have MCP servers, CC startup will be much faster',
+  },
+  {
+    id: 'mcp-batch-size',
+    name: 'MCP batch size',
+    group: PatchGroup.FEATURES,
+    description: 'Change the number of MCP servers started in parallel',
+  },
+  {
+    id: 'user-message-display',
+    name: 'User message display',
+    group: PatchGroup.FEATURES,
+    description: 'User messages in the chat history will be styled',
+  },
+  {
+    id: 'input-pattern-highlighters',
+    name: 'Input pattern highlighters',
+    group: PatchGroup.FEATURES,
+    description: 'Custom input highlighters will be registered',
+  },
+  {
+    id: 'conversation-title',
+    name: 'Conversation title',
+    group: PatchGroup.FEATURES,
+    description: '/title command will be created & enabled',
+  },
+  {
+    id: 'voice-mode',
+    name: 'Voice mode',
+    group: PatchGroup.FEATURES,
+    description:
+      'Enable /voice command for speech-to-text input (hold Space to record)',
+  },
+  {
+    id: 'channels-mode',
+    name: 'Channels mode',
+    group: PatchGroup.FEATURES,
+    description:
+      'Enable MCP channel notifications (--channels without allowlist or dev flag)',
+  },
+  {
+    id: 'disable-ctrl-z',
+    name: 'Disable Ctrl-Z suspend',
+    group: PatchGroup.MISC_CONFIGURABLE,
+    description: 'Ctrl-Z will no longer suspend Claude Code',
+  },
+  {
+    id: 'skip-skill-shell-validation',
+    name: 'Skip skill shell validation',
+    group: PatchGroup.MISC_CONFIGURABLE,
+    description:
+      'Run !`...` commands in your own skills/commands without the permission check (SECURITY: includes project .claude skills; explicit deny rules still apply; plugins unaffected)',
+  },
+  {
+    id: 'shimmer-style',
+    name: 'Shimmer style',
+    group: PatchGroup.MISC_CONFIGURABLE,
+    description: 'Spinner message shimmer will be toggled, sped up, or widened',
+  },
+  {
+    id: 'skip-dev-channels-dialog',
+    name: 'Skip development channels warning',
+    group: PatchGroup.FEATURES,
+    description:
+      'Accept the --dangerously-load-development-channels warning automatically',
+  },
+  {
+    id: 'skip-trust-dialog',
+    name: 'Skip workspace trust dialog',
+    group: PatchGroup.FEATURES,
+    description:
+      'Trust every folder without asking, as if you chose "Yes, I trust this folder"',
+  },
+  {
+    id: 'prevent-unsupported-updates',
+    name: 'Prevent unsupported updates',
+    group: PatchGroup.MISC_CONFIGURABLE,
+    description: 'Native/npm auto-updates require a published prompt snapshot',
+  },
+  {
+    id: 'keep-patched-binary',
+    name: 'Keep patched binary on update',
+    group: PatchGroup.MISC_CONFIGURABLE,
+    description:
+      'The native installer keeps the binary tweakcc wrote instead of re-downloading it',
+  },
+  {
+    id: 'webfetch-user-agent',
+    name: 'WebFetch User-Agent',
+    group: PatchGroup.MISC_CONFIGURABLE,
+    description: 'WebFetch sends the configured User-Agent string',
+  },
+] as const;
+
+/** Union type of all valid patch IDs */
+export type PatchId = (typeof PATCH_DEFINITIONS)[number]['id'];
+
+/** Patch definition interface (derived from PATCH_DEFINITIONS) */
+export interface PatchDefinition {
+  id: PatchId;
+  name: string;
+  group: PatchGroup;
+  description: string;
+}
+
+/**
+ * Returns the list of all available patches with their IDs, names, groups, and descriptions.
+ * Used by --list-patches flag.
+ */
+export const getAllPatchDefinitions = (): PatchDefinition[] => {
+  return [...PATCH_DEFINITIONS];
+};
+
+/** Patch implementation with function and optional condition */
+interface PatchImplementation {
+  fn: (content: string) => string | null;
+  condition?: boolean;
+}
+
+// =============================================================================
+// Legacy types (for backward compatibility with patchesAppliedIndication)
+// =============================================================================
+
+export interface PatchApplied {
+  newContent: string;
+  items: string[];
+}
+
+// =============================================================================
+// Helper Functions
+// =============================================================================
+
+export const escapeIdent = (ident: string): string => {
+  return ident.replace(/\$/g, '\\$');
+};
+
+/**
+ * Apply patches to content using the implementations map, tracking results.
+ * @param patchFilter - Optional list of patch IDs to apply (if provided, only matching patches are applied)
+ */
+const applyPatchImplementations = (
+  content: string,
+  implementations: Record<PatchId, PatchImplementation>,
+  patchFilter?: string[] | null
+): { content: string; results: PatchResult[] } => {
+  const results: PatchResult[] = [];
+
+  // Process patches in the order defined in PATCH_DEFINITIONS
+  for (const def of PATCH_DEFINITIONS) {
+    const impl = implementations[def.id];
+
+    // Skip patches not in the filter (if filter is provided)
+    if (patchFilter && !patchFilter.includes(def.id)) {
+      results.push({
+        id: def.id,
+        name: def.name,
+        group: def.group,
+        applied: false,
+        skipped: true,
+        description: def.description,
+      });
+      continue;
+    }
+
+    // Skip patches where condition is explicitly false, but record them as skipped
+    if (impl.condition === false) {
+      results.push({
+        id: def.id,
+        name: def.name,
+        group: def.group,
+        applied: false,
+        skipped: true,
+        description: def.description,
+      });
+      continue;
+    }
+
+    debug(`Applying patch: ${def.name}`);
+    const result = impl.fn(content);
+    const failed = result === null;
+    const applied = !failed && result !== content;
+
+    if (!failed) {
+      content = result;
+    }
+
+    results.push({
+      id: def.id,
+      name: def.name,
+      group: def.group,
+      applied,
+      failed,
+      description: def.description,
+    });
+  }
+
+  return { content, results };
+};
+
+// =============================================================================
+// Patch Implementations
+// =============================================================================
+
+/**
+ * Builds the id → implementation table for one apply. Pure (no I/O), so the
+ * same table drives both the single-bundle path and the code-split native
+ * module-graph path.
+ */
+export const buildPatchImplementations = (
+  config: TweakccConfig,
+  ccInstInfo: Pick<ClaudeCodeInstallationInfo, 'version'> &
+    Partial<Pick<ClaudeCodeInstallationInfo, 'nativeInstallationPath'>>,
+  legacyItems: string[]
+): Record<PatchId, PatchImplementation> => {
+  // Extract config values that are used multiple times or need pre-computation
+  const tableFormat = config.settings.misc?.tableFormat ?? 'default';
+  const showTweakccVersion = config.settings.misc?.showTweakccVersion ?? true;
+  const showPatchesApplied = config.settings.misc?.showPatchesApplied ?? true;
+
+  // ==========================================================================
+  // Define patch implementations (keyed by PatchId)
+  // ==========================================================================
+  // Keep model list customization and select-menu size behavior in sync.
+  // Disabling model customizations should restore both selectors to vanilla CC behavior.
+  const modelCustomizationsEnabled =
+    config.settings.misc?.enableModelCustomizations ?? true;
+  const patchImplementations: Record<PatchId, PatchImplementation> = {
+    // Always Applied
+    'verbose-property': {
+      fn: c => writeVerboseProperty(c),
+    },
+    'context-limit': {
+      fn: c => writeContextLimit(c),
+      condition: !!config.settings.misc?.enableContextLimitOverride,
+    },
+    opusplan1m: {
+      fn: c => writeOpusplan1m(c),
+    },
+    'thinking-block-styling': {
+      fn: c => writeThinkingBlockStyling(c),
+      condition:
+        ccInstInfo.version == null ||
+        compareVersions(ccInstInfo.version, '2.1.26') < 0,
+    },
+    'fix-lsp-support': {
+      fn: c => writeFixLspSupport(c),
+    },
+    'statusline-update-throttle': {
+      fn: c =>
+        writeStatuslineUpdateThrottle(
+          c,
+          config.settings.misc?.statuslineThrottleMs ?? 300,
+          config.settings.misc?.statuslineUseFixedInterval ?? false
+        ),
+      condition: config.settings.misc?.statuslineThrottleMs != null,
+    },
+    'clear-screen': {
+      fn: c => writeClearScreen(c),
+    },
+    'session-color': {
+      fn: c => writeSessionColor(c),
+    },
+    'keybinding-customization': {
+      fn: c => writeKeybindingCustomization(c),
+    },
+    'plan-exit-command': {
+      fn: c => writePlanExitCommand(c),
+    },
+    // Misc Configurable
+    'patches-applied-indication': {
+      fn: c =>
+        writePatchesAppliedIndication(
+          c,
+          '4.4.0',
+          legacyItems,
+          showTweakccVersion,
+          showPatchesApplied,
+          !!config.settings.misc?.hideStartupBanner
+        ),
+    },
+    'model-customizations': {
+      fn: c => writeModelCustomizations(c),
+      condition: modelCustomizationsEnabled,
+    },
+    'show-more-items-in-select-menus': {
+      fn: c => writeShowMoreItemsInSelectMenus(c, 25),
+      condition: modelCustomizationsEnabled,
+    },
+    'table-format': {
+      fn: c => writeTableFormat(c, tableFormat),
+      condition: tableFormat !== 'default',
+    },
+    themes: {
+      fn: c => writeThemes(c, config.settings.themes!),
+      condition: !!(
+        config.settings.themes &&
+        config.settings.themes.length > 0 &&
+        JSON.stringify(config.settings.themes) !==
+          JSON.stringify(DEFAULT_SETTINGS.themes)
+      ),
+    },
+    'thinking-verbs': {
+      fn: c => writeThinkingVerbs(c, config.settings.thinkingVerbs!.verbs),
+      condition:
+        !!config.settings.thinkingVerbs &&
+        JSON.stringify(config.settings.thinkingVerbs.verbs) !==
+          JSON.stringify(DEFAULT_SETTINGS.thinkingVerbs.verbs),
+    },
+    'thinker-format': {
+      fn: c => writeThinkerFormat(c, config.settings.thinkingVerbs!.format),
+      condition:
+        !!config.settings.thinkingVerbs &&
+        config.settings.thinkingVerbs.format !==
+          DEFAULT_SETTINGS.thinkingVerbs.format,
+    },
+    'thinker-symbol-chars': {
+      fn: c => writeThinkerSymbolChars(c, config.settings.thinkingStyle.phases),
+      condition:
+        JSON.stringify(config.settings.thinkingStyle.phases) !==
+        JSON.stringify(DEFAULT_SETTINGS.thinkingStyle.phases),
+    },
+    'thinker-symbol-speed': {
+      fn: c =>
+        writeThinkerSymbolSpeed(
+          c,
+          config.settings.thinkingStyle.updateInterval,
+          config.settings.thinkingStyle.phases.length
+        ),
+      // CC < 2.1.27: fixed-interval stepping; CC 2.1.2xx: cosine "breathing"
+      // period (see thinkerSymbolSpeed.ts).
+      condition:
+        config.settings.thinkingStyle.updateInterval !==
+        DEFAULT_SETTINGS.thinkingStyle.updateInterval,
+    },
+    'thinker-symbol-width': {
+      fn: c =>
+        writeThinkerSymbolWidthLocation(
+          c,
+          thinkerSymbolBoxWidth(config.settings.thinkingStyle.phases)
+        ),
+      condition:
+        JSON.stringify(config.settings.thinkingStyle.phases) !==
+        JSON.stringify(DEFAULT_SETTINGS.thinkingStyle.phases),
+    },
+    'thinker-symbol-mirror': {
+      fn: c =>
+        writeThinkerSymbolMirrorOption(
+          c,
+          config.settings.thinkingStyle.reverseMirror
+        ),
+      condition:
+        config.settings.thinkingStyle.reverseMirror !==
+        DEFAULT_SETTINGS.thinkingStyle.reverseMirror,
+    },
+    'input-box-border': {
+      fn: c => writeInputBoxBorder(c, config.settings.inputBox!.removeBorder),
+      condition: !!(
+        config.settings.inputBox &&
+        config.settings.inputBox.removeBorder !==
+          DEFAULT_SETTINGS.inputBox.removeBorder
+      ),
+    },
+    'input-chevron-color': {
+      fn: c => {
+        const themeColorKey = config.settings.inputBox!.chevronIdleThemeColor!;
+        const theme = config.settings.themes?.[0];
+        const resolved =
+          (theme?.colors as Record<string, string>)?.[themeColorKey] ??
+          themeColorKey;
+        return writeInputChevronColor(c, resolved);
+      },
+      condition: !!config.settings.inputBox?.chevronIdleThemeColor,
+    },
+    'input-cursor-color': {
+      fn: c => {
+        const cursorColor = config.settings.inputBox!.cursorColor!;
+        const theme = config.settings.themes?.[0];
+        const resolved =
+          (theme?.colors as Record<string, string>)?.[cursorColor] ??
+          cursorColor;
+        return writeInputCursorColor(c, resolved);
+      },
+      condition: !!config.settings.inputBox?.cursorColor,
+    },
+    'subagent-models': {
+      fn: c => writeSubagentModels(c, config.settings.subagentModels!),
+      condition:
+        !!config.settings.subagentModels &&
+        JSON.stringify(config.settings.subagentModels) !==
+          JSON.stringify(DEFAULT_SETTINGS.subagentModels),
+    },
+    'thinking-visibility': {
+      fn: c => writeThinkingVisibility(c),
+      condition: config.settings.misc?.expandThinkingBlocks ?? true,
+    },
+    'hide-startup-banner': {
+      fn: c => writeHideStartupBanner(c),
+      condition: !!config.settings.misc?.hideStartupBanner,
+    },
+    'hide-ctrl-g-to-edit': {
+      fn: c => writeHideCtrlGToEdit(c),
+      condition: !!config.settings.misc?.hideCtrlGToEdit,
+    },
+    'hide-startup-clawd': {
+      fn: c => writeHideStartupClawd(c),
+      condition: !!config.settings.misc?.hideStartupClawd,
+    },
+    'increase-file-read-limit': {
+      fn: c => writeIncreaseFileReadLimit(c),
+      condition: !!config.settings.misc?.increaseFileReadLimit,
+    },
+    'suppress-line-numbers': {
+      fn: c => writeSuppressLineNumbers(c),
+      condition: !!config.settings.misc?.suppressLineNumbers,
+    },
+    'suppress-rate-limit-options': {
+      fn: c => writeSuppressRateLimitOptions(c),
+      condition: !!config.settings.misc?.suppressRateLimitOptions,
+    },
+    'suppress-rate-limit-warning': {
+      fn: c => writeSuppressRateLimitWarning(c),
+      condition: !!config.settings.misc?.suppressRateLimitWarning,
+    },
+    'token-count-rounding': {
+      fn: c =>
+        writeTokenCountRounding(c, config.settings.misc!.tokenCountRounding!),
+      condition: !!config.settings.misc?.tokenCountRounding,
+    },
+    'remember-skill': {
+      fn: c => writeRememberSkill(c),
+      condition: !!config.settings.misc?.enableRememberSkill,
+    },
+    'agents-md': {
+      fn: c => writeAgentsMd(c, config.settings.claudeMdAltNames!),
+      condition: !!(
+        config.settings.claudeMdAltNames &&
+        config.settings.claudeMdAltNames.length > 0
+      ),
+    },
+    'auto-accept-plan-mode': {
+      fn: c => writeAutoAcceptPlanMode(c),
+      condition: !!config.settings.misc?.autoAcceptPlanMode,
+    },
+    'auto-accept-plan-env': {
+      fn: c => writeAutoAcceptPlanMode(c, true),
+      condition:
+        !config.settings.misc?.autoAcceptPlanMode &&
+        !!config.settings.misc?.autoAcceptPlanModeEnv,
+    },
+    'allow-sudo-bypass-permissions': {
+      fn: c => writeAllowBypassPermsInSudo(c),
+      condition: !!config.settings.misc?.allowBypassPermissionsInSudo,
+    },
+    'suppress-native-installer-warning': {
+      fn: c => writeSuppressNativeInstallerWarning(c),
+      condition: !!config.settings.misc?.suppressNativeInstallerWarning,
+    },
+    'filter-scroll-escape-sequences': {
+      fn: c => writeScrollEscapeSequenceFilter(c),
+      condition: !!config.settings.misc?.filterScrollEscapeSequences,
+    },
+    'tmux-graphics-passthrough': {
+      fn: c => writeTmuxGraphicsPassthrough(c),
+      condition: !!config.settings.misc?.tmuxGraphicsPassthrough,
+    },
+    // Features
+    'allow-custom-agent-models': {
+      fn: c => writeAllowCustomAgentModels(c),
+      condition: !!config.settings.misc?.allowCustomAgentModels,
+    },
+    'worktree-mode': {
+      fn: c => writeWorktreeMode(c),
+      condition: !!config.settings.misc?.enableWorktreeMode,
+    },
+    'session-memory': {
+      fn: c => writeSessionMemory(c),
+      condition: !!config.settings.misc?.enableSessionMemory,
+    },
+    toolsets: {
+      fn: c =>
+        writeToolsets(
+          c,
+          config.settings.toolsets!,
+          config.settings.defaultToolset,
+          config.settings.acceptEditsToolset,
+          config.settings.planModeToolset
+        ),
+      condition: !!(
+        config.settings.toolsets && config.settings.toolsets.length > 0
+      ),
+    },
+    'mcp-non-blocking': {
+      fn: c => writeMcpNonBlocking(c),
+      condition: !!config.settings.misc?.mcpConnectionNonBlocking,
+    },
+    'mcp-batch-size': {
+      fn: c => writeMcpBatchSize(c, config.settings.misc!.mcpServerBatchSize!),
+      condition: !!config.settings.misc?.mcpServerBatchSize,
+    },
+    'user-message-display': {
+      fn: c => writeUserMessageDisplay(c, config.settings.userMessageDisplay!),
+      condition: isUserMessageDisplayCustomized(
+        config.settings.userMessageDisplay
+      ),
+    },
+    'input-pattern-highlighters': {
+      fn: c =>
+        writeInputPatternHighlighters(
+          c,
+          config.settings.inputPatternHighlighters!
+        ),
+      condition: !!(
+        config.settings.inputPatternHighlighters &&
+        config.settings.inputPatternHighlighters.length > 0
+      ),
+    },
+    'conversation-title': {
+      fn: c => writeConversationTitle(c),
+      condition:
+        (config.settings.misc?.enableConversationTitle ?? true) &&
+        !!(
+          ccInstInfo.version &&
+          compareVersions(ccInstInfo.version, '2.0.64') < 0
+        ),
+    },
+    'voice-mode': {
+      fn: c =>
+        writeVoiceMode(
+          c,
+          config.settings.misc?.enableVoiceConciseOutput ?? true
+        ),
+      condition: !!config.settings.misc?.enableVoiceMode,
+    },
+    'channels-mode': {
+      fn: c => writeChannelsMode(c),
+      condition: !!config.settings.misc?.enableChannelsMode,
+    },
+    'disable-ctrl-z': {
+      fn: c => writeDisableCtrlZSuspend(c),
+      condition: !!config.settings.misc?.disableCtrlZSuspend,
+    },
+    'skip-skill-shell-validation': {
+      fn: c => writeSkipSkillShellValidation(c),
+      condition: !!config.settings.misc?.skipSkillShellValidation,
+    },
+    'shimmer-style': {
+      fn: c => writeShimmerStyle(c, config.settings.misc!.shimmer),
+      condition: isShimmerCustomized(config.settings.misc?.shimmer),
+    },
+    'skip-dev-channels-dialog': {
+      fn: c => writeSkipDevChannelsDialog(c),
+      condition: !!config.settings.misc?.skipDevChannelsDialog,
+    },
+    'skip-trust-dialog': {
+      fn: c => writeSkipTrustDialog(c),
+      condition: !!config.settings.misc?.skipTrustDialog,
+    },
+    // npm monolith only. Native builds spread the updater over several
+    // modules; applyCustomization patches the whole module graph at once.
+    'prevent-unsupported-updates': {
+      fn: c =>
+        ccInstInfo.nativeInstallationPath
+          ? null
+          : writePreventUnsupportedUpdates(c),
+      condition: !!config.settings.misc?.preventUpdateToUnsupportedVersions,
+    },
+    'keep-patched-binary': {
+      fn: c => writeKeepPatchedBinary(c, APPLIED_RECORD_FILE),
+      condition:
+        !!ccInstInfo.nativeInstallationPath &&
+        (config.settings.misc?.keepPatchedBinaryOnUpdate ?? true),
+    },
+    'webfetch-user-agent': {
+      fn: c =>
+        writeWebFetchUserAgent(c, config.settings.misc!.webFetchUserAgent!),
+      condition: !!config.settings.misc?.webFetchUserAgent,
+    },
+  };
+
+  return patchImplementations;
+};
+
+/**
+ * Escape ANSI codes etc. so patch-result strings render properly when
+ * injected into a JS string literal in the bundle.
+ */
+const escapeForCliJs = (str: string): string =>
+  str.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\$/g, '\\$');
+
+/**
+ * Patches that prepend process-wide startup code to the source they are
+ * given; on a code-split graph they must only touch the entry module.
+ * (filter-scroll-escape-sequences used to be one; it now installs itself,
+ * once, from every module that writes to stdout.)
+ */
+const ENTRY_ONLY_PATCHES: ReadonlySet<string> = new Set<string>([]);
+
+/**
+ * Applies the update guard to every JavaScript module of a code-split graph at
+ * once (it edits both the updater's caller and its installer). Returns null
+ * when the guard is disabled or filtered out.
+ */
+export const applyUpdateGuardToGraph = (
+  config: TweakccConfig,
+  graphSources: Map<string, string>,
+  patchFilter?: readonly string[] | null
+): PatchResult | null => {
+  const definition = PATCH_DEFINITIONS.find(
+    def => def.id === 'prevent-unsupported-updates'
+  )!;
+  const base = {
+    id: definition.id,
+    name: definition.name,
+    group: definition.group,
+    description: definition.description,
+  };
+  if (patchFilter && !patchFilter.includes(definition.id)) {
+    return { ...base, applied: false, skipped: true };
+  }
+  if (!config.settings.misc?.preventUpdateToUnsupportedVersions) {
+    return { ...base, applied: false, skipped: true };
+  }
+  const names = [...graphSources.keys()];
+  const sources = names.map(name => graphSources.get(name)!);
+  const patched = writePreventUnsupportedUpdatesModules(sources);
+  if (!patched) {
+    return {
+      ...base,
+      applied: false,
+      failed: true,
+      details: 'Updater not found in any module',
+    };
+  }
+  let changed = 0;
+  patched.forEach((source, index) => {
+    if (source === sources[index]) return;
+    graphSources.set(names[index], source);
+    changed++;
+  });
+  return {
+    ...base,
+    applied: changed > 0,
+    details: changed > 0 ? `Updated ${changed} module(s).` : undefined,
+  };
+};
+
+// =============================================================================
+// Main Apply Function
+// =============================================================================
+
+export const applyCustomization = async (
+  config: TweakccConfig,
+  ccInstInfo: ClaudeCodeInstallationInfo,
+  patchFilter?: string[] | null
+): Promise<ApplyCustomizationResult> => {
+  let content = '';
+  // Code-split native builds (CC 2.1.2xx+) ship thousands of Bun modules; the
+  // patchable source is spread across them instead of one claude.js.
+  let nativeGraph: NativeBunGraph | null = null;
+  let pathToExtractFrom = '';
+
+  if (ccInstInfo.nativeInstallationPath) {
+    // For native installations: restore the binary, then extract to memory
+    await restoreNativeBinaryFromBackup(ccInstInfo);
+
+    // Extract from backup if it exists, otherwise from the native installation
+    let backupExists = false;
+    try {
+      await fs.stat(NATIVE_BINARY_BACKUP_FILE);
+      backupExists = true;
+    } catch {
+      // Backup doesn't exist, extract from native installation
+    }
+
+    pathToExtractFrom = backupExists
+      ? NATIVE_BINARY_BACKUP_FILE
+      : ccInstInfo.nativeInstallationPath;
+
+    debug(
+      `Extracting claude.js from ${backupExists ? 'backup' : 'native installation'}: ${pathToExtractFrom}`
+    );
+
+    const graph = await extractNativeInstallationModules(pathToExtractFrom);
+    if (graph && graph.modules.length > 1) {
+      nativeGraph = graph;
+    } else {
+      const claudeJsBuffer =
+        await extractClaudeJsFromNativeInstallation(pathToExtractFrom);
+
+      if (!claudeJsBuffer) {
+        throw new Error('Failed to extract claude.js from native installation');
+      }
+
+      // Save original extracted JS for debugging
+      const origPath = path.join(CONFIG_DIR, 'native-claudejs-orig.js');
+      fsSync.writeFileSync(origPath, claudeJsBuffer);
+      debug(`Saved original extracted JS from native to: ${origPath}`);
+
+      content = claudeJsBuffer.toString('utf8');
+    }
+  } else {
+    // For NPM installations: restore cli.js from backup, then read it
+    await restoreClijsFromBackup(ccInstInfo);
+
+    if (!ccInstInfo.cliPath) {
+      throw new Error('cliPath is required for NPM installations');
+    }
+
+    content = await fs.readFile(ccInstInfo.cliPath, { encoding: 'utf8' });
+  }
+
+  // Working copy of every JavaScript module's source, keyed by module name.
+  const graphSources = nativeGraph
+    ? javaScriptModuleSources(nativeGraph)
+    : null;
+  // Embedded .md modules rewritten by system-prompt customizations; kept
+  // apart so JS patch writers never run against markdown.
+  const textPromptSources = new Map<string, string>();
+
+  // Collect all patch results
+  const allResults: PatchResult[] = [];
+
+  // ==========================================================================
+  // Apply system prompt customizations (has its own result format)
+  // ==========================================================================
+  if (graphSources) {
+    // Prompts live in JS modules and, for skills, in embedded .md modules.
+    const textSources = textModuleSources(nativeGraph!);
+    const promptSources = new Map([...graphSources, ...textSources]);
+    const names = [...promptSources.keys()];
+    const systemPromptsResult = await applySystemPrompts(
+      names.map(name => promptSources.get(name)!),
+      ccInstInfo.version,
+      undefined, // escapeNonAscii - auto-detect
+      patchFilter,
+      new Set(names.flatMap((name, i) => (textSources.has(name) ? [i] : [])))
+    );
+    systemPromptsResult.newContents.forEach((source, i) => {
+      if (source === promptSources.get(names[i])) return;
+      if (textSources.has(names[i])) textPromptSources.set(names[i], source);
+      else graphSources.set(names[i], source);
+    });
+    allResults.push(
+      ...[...systemPromptsResult.results].sort((a, b) =>
+        a.name.localeCompare(b.name)
+      )
+    );
+  } else {
+    const systemPromptsResult = await applySystemPrompts(
+      content,
+      ccInstInfo.version,
+      undefined, // escapeNonAscii - auto-detect
+      patchFilter
+    );
+    content = systemPromptsResult.newContent;
+    allResults.push(
+      ...[...systemPromptsResult.results].sort((a, b) =>
+        a.name.localeCompare(b.name)
+      )
+    );
+  }
+
+  // Legacy items array for patchesAppliedIndication (backward compatibility)
+  const legacyItems: string[] = allResults
+    .filter(r => r.applied && r.details)
+    .map(r => escapeForCliJs(`${r.name}: ${r.details}`));
+
+  const patchImplementations = buildPatchImplementations(
+    config,
+    ccInstInfo,
+    legacyItems
+  );
+
+  if (nativeGraph && graphSources) {
+    const { results: graphResults } = applyPatchImplementationsToGraph(
+      graphSources,
+      patchImplementations,
+      PATCH_DEFINITIONS.filter(def => def.id !== 'prevent-unsupported-updates'),
+      patchFilter,
+      {
+        entryModule: nativeGraph.modules[nativeGraph.entryPointIndex]?.name,
+        entryOnly: ENTRY_ONLY_PATCHES,
+      }
+    );
+    allResults.push(...graphResults);
+
+    // The update guard spans the updater's caller and installer modules, so it
+    // is applied to the whole graph at once rather than module by module.
+    const guardResult = applyUpdateGuardToGraph(
+      config,
+      graphSources,
+      patchFilter
+    );
+    if (guardResult) allResults.push(guardResult);
+
+    const replacements = changedModuleSources(nativeGraph, graphSources);
+    for (const [name, contents] of replacements)
+      assertPatchedModuleParses(name, contents.toString('utf8'), () =>
+        javaScriptModuleSources({
+          ...nativeGraph,
+          modules: nativeGraph.modules.filter(module => module.name === name),
+        }).get(name)
+      );
+    for (const [name, contents] of changedModuleSources(
+      nativeGraph,
+      textPromptSources
+    ))
+      replacements.set(name, contents);
+    if (replacements.size > 0) {
+      await repackNativeInstallationModuleGraph(
+        pathToExtractFrom,
+        replacements,
+        ccInstInfo.nativeInstallationPath!
+      );
+    }
+    await recordAppliedBinary(
+      ccInstInfo.nativeInstallationPath!,
+      ccInstInfo.version
+    );
+    const updatedConfig = await updateConfigFile(cfg => {
+      cfg.changesApplied = !allResults.some(result => result.failed);
+      cfg.ccVersion = ccInstInfo.version;
+    });
+    return { config: updatedConfig, results: allResults };
+  }
+
+  // ==========================================================================
+  // Apply all patches
+  // ==========================================================================
+  const { content: patchedContent, results: patchResults } =
+    applyPatchImplementations(content, patchImplementations, patchFilter);
+  // Unmodified native bytes are not repacked; the restored backup stays as is.
+  const nativeChanged = patchedContent !== content;
+  content = patchedContent;
+  allResults.push(...patchResults);
+
+  // ==========================================================================
+  // Verify the patched bundle parses before writing it
+  // ==========================================================================
+  try {
+    if (!ccInstInfo.nativeInstallationPath || nativeChanged) {
+      assertPatchedBundleParses(
+        content,
+        ccInstInfo.nativeInstallationPath ? 'auto' : 'module'
+      );
+    }
+  } catch (err) {
+    if (!(err instanceof PatchedBundleParseError)) {
+      throw err;
+    }
+    debug(`Patched bundle failed to parse: ${String(err)}`);
+    await updateConfigFile(cfg => {
+      cfg.changesApplied = false;
+    });
+    throw err;
+  }
+
+  // ==========================================================================
+  // Write the modified content back
+  // ==========================================================================
+  if (ccInstInfo.nativeInstallationPath && nativeChanged) {
+    debug(
+      `Repacking modified claude.js into native installation: ${ccInstInfo.nativeInstallationPath}`
+    );
+
+    // Save patched JS for debugging
+    const patchedPath = path.join(CONFIG_DIR, 'native-claudejs-patched.js');
+    fsSync.writeFileSync(patchedPath, content, 'utf8');
+    debug(`Saved patched JS from native to: ${patchedPath}`);
+
+    const modifiedBuffer = Buffer.from(content, 'utf8');
+    await repackNativeInstallation(
+      ccInstInfo.nativeInstallationPath,
+      modifiedBuffer,
+      ccInstInfo.nativeInstallationPath
+    );
+  } else if (!ccInstInfo.nativeInstallationPath) {
+    // For NPM installations: replace the cli.js file
+    if (!ccInstInfo.cliPath) {
+      throw new Error('cliPath is required for NPM installations');
+    }
+
+    await replaceFileBreakingHardLinks(ccInstInfo.cliPath, content, 'patch');
+  }
+  if (ccInstInfo.nativeInstallationPath) {
+    await recordAppliedBinary(
+      ccInstInfo.nativeInstallationPath,
+      ccInstInfo.version
+    );
+  }
+
+  const updatedConfig = await updateConfigFile(cfg => {
+    cfg.changesApplied = !allResults.some(result => result.failed);
+  });
+
+  return {
+    config: updatedConfig,
+    results: allResults,
+  };
+};
